@@ -1123,4 +1123,243 @@ async def anthropic_messages(request: Request):
     if "tools" in odata:
         openai_tools = translate_anthropic_tools_to_openai(odata["tools"])
 
-    # Add our websearch tool when web_searc... (12 KB left)
+    # Add our websearch tool when web_search is enabled
+    if web_search:
+        # Find the websearch tool from our schema
+        for tool in TOOLS_SCHEMA:
+            if tool["function"]["name"] == "websearch":
+                openai_tools.append(tool)
+                break
+
+    # 6. Construct unified OpenAI request payload
+    openai_payload = {
+        "model": mapped_model,
+        "messages": openai_msgs,
+        "stream": True,
+        "deepThink": think_enabled,
+        "webSearch": web_search  # Use the web_search flag directly
+    }
+    if openai_tools:
+        openai_payload["tools"] = openai_tools
+        openai_payload["tool_choice"] = "auto"
+
+    log_verbose("Incoming Anthropic /v1/messages request", {
+        "session_id": session_id,
+        "fresh_session": fresh_session,
+        "model": requested_model,
+        "thinking_enabled": think_enabled,
+        "message_count": len(odata.get("messages", [])),
+        "tool_count": len(odata.get("tools", [])),
+        "messages": odata.get("messages", []),
+        "tools": odata.get("tools", []),
+    })
+    log_verbose("Translated OpenAI payload", openai_payload)
+
+    upstream_completions_url = f"{UPSTREAM_BASE_URL}/chat/completions"
+
+    return StreamingResponse(
+        stream_openai_to_anthropic(
+            upstream_completions_url,
+            openai_payload,
+            session_id,
+            fresh_session,
+            requested_model,
+        ),
+        media_type="text/event-stream"
+    )
+
+def run_fastapi_server(port: int, verbose: bool = False):
+    """Background runner for FastAPI reverse proxy."""
+    global VERBOSE
+    VERBOSE = verbose
+    log_config = LOGGING_CONFIG
+    log_config["formatters"]["default"]["fmt"] = "%(asctime)s - %(levelname)s - %(message)s"
+    uvicorn.run(app, host="127.0.0.1", port=port, log_level="info" if verbose else "warning", access_log=verbose)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN CLIENT & SERVER RUNNER
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="Z.AI Direct Bridge CLI Agent Evaluator")
+    parser.add_argument("--model", "-m", type=str, help="Skip interactive menu and set target model directly")
+    parser.add_argument("--prompt", "-p", type=str, help="Execute a single prompt directly and exit immediately")
+    parser.add_argument("--think", "-t", action="store_true", default=True, help="Enable Deep Think (default: True)")
+    parser.add_argument("--no-think", dest="think", action="store_false", help="Disable Deep Think")
+    parser.add_argument("--search", "-s", action="store_true", default=True, help="Enable Web Search (default: True)")
+    parser.add_argument("--no-search", dest="search", action="store_false", help="Disable Web Search")
+    parser.add_argument("--key", "-k", type=str, default=DEFAULT_API_KEY, help="API Key credentials (default: Waguri)")
+    parser.add_argument("--url", "-u", type=str, default=DEFAULT_BASE_URL, help="Base API target URL")
+    parser.add_argument("--session", "-S", type=str, default="zai-session-cli-default", help="Custom session thread ID")
+    parser.add_argument("--fresh", "-F", action="store_true", default=False, help="Force a fresh thread initialization")
+    parser.add_argument("--no-tools", action="store_true", default=False, help="Turn off OpenAI agent tool-calling capabilities")
+    parser.add_argument("--port", "-P", type=int, default=8080, help="Local FastAPI proxy server port (default: 8080)")
+    parser.add_argument("--server-only", action="store_true", default=False, help="Run only the FastAPI translator proxy server")
+    parser.add_argument("--verbose", action="store_true", default=False, help="Print detailed Anthropic/OpenAI translation traces and upstream payloads")
+
+    args = parser.parse_args()
+    global VERBOSE, UPSTREAM_BASE_URL, UPSTREAM_API_KEY
+    VERBOSE = args.verbose
+    UPSTREAM_BASE_URL = args.url
+    UPSTREAM_API_KEY = args.key
+
+    # Check if port is already in use
+    def is_port_in_use(port: int) -> bool:
+        import socket
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            return s.connect_ex(('127.0.0.1', port)) == 0
+
+    port_in_use = is_port_in_use(args.port)
+    if port_in_use:
+        console.print(f"[warning]⚠[/warning] Port {args.port} is already in use. Skipping proxy server startup.")
+    else:
+        # Launch FastAPI reverse-proxy server on port 8080 in a background daemon thread
+        server_thread = threading.Thread(target=run_fastapi_server, args=(args.port, args.verbose), daemon=True)
+        server_thread.start()
+
+        # Pause a brief moment to let uvicorn initialize
+        time.sleep(1.5)
+
+    if args.server_only:
+        console.print(f"\n[success]✓[/success] [bold green]FastAPI Anthropic -> OpenAI Reverse Proxy active![/bold green]")
+        console.print(f"  Listening on: [cyan]http://localhost:{args.port}[/cyan]")
+        console.print("  Press Ctrl+C to terminate.")
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            console.print("\n[info]Shutting down proxy server.[/info]")
+            sys.exit(0)
+
+    console.print(Panel.fit(
+        "🔥 [bold cyan]Z.AI Direct Bridge CLI Agent Evaluator[/bold cyan] 🔥\n"
+        "Powered by modernc SQLite and Native Go-Ciphers",
+        border_style="cyan"
+    ))
+
+    if not run_health_check(args.url):
+        sys.exit(1)
+
+    # Initialize OpenAI Client matching target local server credentials
+    client = OpenAI(base_url=args.url, api_key=args.key)
+
+    # Fetch and select model
+    models = get_available_models(client)
+    
+    # Resolve target model
+    active_model = args.model if args.model in models else None
+    if not active_model:
+        active_model = select_model(models, default_model=args.model)
+
+    deep_think = args.think
+    web_search = args.search
+    session_id = args.session
+    fresh_trigger = args.fresh
+    use_tools = not args.no_tools
+
+    # Enable server-side history compilation for the active model
+    enable_history_persistence(active_model, args.url, args.key)
+
+    # ---------- Single Direct Prompt Mode ----------
+    if args.prompt:
+        messages = [{"role": "user", "content": args.prompt}]
+        evaluate_prompt(
+            client=client,
+            model=active_model,
+            messages=messages,
+            think=deep_think,
+            search=web_search,
+            session_id=session_id,
+            fresh_session=fresh_trigger,
+            use_tools=use_tools
+        )
+        sys.exit(0)
+
+    # ---------- Interactive Loop Mode ----------
+    conversation_history = []
+
+    console.print("\n[bold green]Shell is active![/bold green] Input prompts below.")
+    console.print("💡 [meta]Commands Available:[/meta]")
+    console.print("   [info]/think[/info]   - Toggle Deep Think status (current: [cyan]%s[/cyan])" % ("ON" if deep_think else "OFF"))
+    console.print("   [info]/search[/info]  - Toggle Web Search status (current: [cyan]%s[/cyan])" % ("ON" if web_search else "OFF"))
+    console.print("   [info]/model[/info]   - Change active model selection")
+    console.print("   [info]/fresh[/info]   - Initialize a fresh session on the active thread")
+    console.print("   [info]/clear[/info]   - Wipe local thread conversation history")
+    console.print("   [info]/nuke[/info]    - Wipe ALL conversation histories globally on the bridge")
+    console.print("   [info]/exit[/info]    - Terminate evaluator shell\n")
+
+    while True:
+        try:
+            # Custom prompt bar showing configuration states
+            prompt_indicator = f"({active_model} | Session: {session_id} | Think:{'ON' if deep_think else 'OFF'} | Search:{'ON' if web_search else 'OFF'}) >>> "
+            user_input = input(prompt_indicator).strip()
+
+            if not user_input:
+                continue
+
+            # Command Routing
+            if user_input.lower() == "/exit":
+                console.print("[info]Exiting evaluator shell. Goodbye![/info]")
+                break
+
+            elif user_input.lower() == "/think":
+                deep_think = not deep_think
+                console.print(f"[success]Deep Think toggled to:[/success] [bold cyan]{'ON' if deep_think else 'OFF'}[/bold cyan]")
+                continue
+
+            elif user_input.lower() == "/search":
+                web_search = not web_search
+                console.print(f"[success]Web Search toggled to:[/success] [bold cyan]{'ON' if web_search else 'OFF'}[/bold cyan]")
+                console.print(f"[info]Web Search is {'ENABLED' if web_search else 'DISABLED'}. The model will use the websearch tool when needed.[/info]")
+                continue
+
+            elif user_input.lower() == "/model":
+                active_model = select_model(models)
+                enable_history_persistence(active_model, args.url, args.key)
+                console.print(f"[success]Active model updated to:[/success] [bold cyan]{active_model}[/bold cyan]")
+                continue
+
+            elif user_input.lower() == "/fresh":
+                fresh_trigger = True
+                conversation_history.clear()
+                console.print(f"[success]✓[/success] Fresh session status flagged for next message.")
+                continue
+
+            elif user_input.lower() == "/clear":
+                clear_active_session(session_id, args.url, args.key)
+                conversation_history.clear()
+                fresh_trigger = True
+                continue
+
+            elif user_input.lower() == "/nuke":
+                clear_all_sessions(args.url, args.key)
+                conversation_history.clear()
+                fresh_trigger = True
+                continue
+
+            # Append user message
+            conversation_history.append({"role": "user", "content": user_input})
+
+            # Evaluate Prompt
+            evaluate_prompt(
+                client=client, 
+                model=active_model, 
+                messages=conversation_history, 
+                think=deep_think, 
+                search=web_search,
+                session_id=session_id,
+                fresh_session=fresh_trigger,
+                use_tools=use_tools
+            )
+            
+            # Reset fresh trigger after the first execution
+            if fresh_trigger:
+                fresh_trigger = False
+
+        except (KeyboardInterrupt, EOFError):
+            console.print("\n[info]Exiting shell session.[/info]")
+            break
+
+
+if __name__ == "__main__":
+    main()
