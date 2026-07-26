@@ -10,7 +10,7 @@ A public instance is already hosted on my servers. You can start using it immedi
 
 | Setting | Value |
 |---|---|
-| **Base URL** | `https://api.lelouch.ndevs.in/v1` |
+| **Base URL** | `https://api.lelouch.indevs.in/v1` |
 | **Auth (Bearer / `x-api-key`)** | `Waguri` |
 | **Supported models** | `glm-5.2` (and others from the live model list) |
 | **Mode** | **Agent mode enabled** (tool-calling / function-calling is supported) |
@@ -24,7 +24,7 @@ A public instance is already hosted on my servers. You can start using it immedi
 from openai import OpenAI
 
 client = OpenAI(
-    base_url="https://api.lelouch.ndevs.in/v1",
+    base_url="https://api.lelouch.indevs.in/v1",
     api_key="Waguri",
 )
 
@@ -38,7 +38,7 @@ print(resp.choices[0].message.content)
 ### Quick start (curl)
 
 ```bash
-curl -N -X POST https://api.lelouch.ndevs.in/v1/chat/completions \
+curl -N -X POST https://api.lelouch.indevs.in/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer Waguri" \
   -d '{
@@ -168,7 +168,7 @@ On startup, you'll see a banner with your health URL, API endpoints, and auth to
 
 ## API Reference
 
-> **Reminder:** On the hosted instance (`api.lelouch.ndevs.in`), the **OpenAI endpoint is recommended**. The Anthropic endpoint works but is considered primitive.
+> **Reminder:** On the hosted instance (`api.lelouch.indevs.in`), the **OpenAI endpoint is recommended**. The Anthropic endpoint works but is considered primitive.
 
 ### OpenAI-Compatible
 
@@ -347,7 +347,7 @@ curl -X POST http://localhost:3001/features \
 
 ## Agent Mode
 
-> The hosted instance at `api.lelouch.ndevs.in` is **already running in agent mode** — you can use tools/function-calling without any extra configuration.
+> The hosted instance at `api.lelouch.indevs.in` is **already running in agent mode** — you can use tools/function-calling without any extra configuration.
 
 Z.AI's unofficial `/api/v2/chat/completions` endpoint only accepts messages with `role="user"`. System, assistant, and tool roles cause `INTERNAL_ERROR`. OpenAI-style `tools` / `tool_calls` are also rejected.
 
@@ -373,7 +373,7 @@ Enabling agent mode also starts the **background captcha cache**, which pre-gene
 
 ## Examples
 
-> The examples below use `localhost` for self-hosting. For the hosted instance, swap the base URL to `https://api.lelouch.ndevs.in/v1` and use `glm-5.2` — auth stays `Waguri`.
+> The examples below use `localhost` for self-hosting. For the hosted instance, swap the base URL to `https://api.lelouch.indevs.in/v1` and use `glm-5.2` — auth stays `Waguri`.
 
 All self-hosted examples use `glm-4.7` so they work **without** `ZAI_TOKEN`.
 
@@ -453,7 +453,7 @@ curl -N -X POST http://localhost:3001/v1/messages \
 from openai import OpenAI
 
 client = OpenAI(
-    base_url="https://api.lelouch.ndevs.in/v1",
+    base_url="https://api.lelouch.indevs.in/v1",
     api_key="Waguri",
 )
 
@@ -597,7 +597,7 @@ zai-api/
 
 ## Notes
 
-- **Hosted instance:** `https://api.lelouch.ndevs.in/v1` — Bearer / `x-api-key`: `Waguri` — supports `glm-5.2` — running in agent mode. OpenAI API recommended; Anthropic API is primitive.
+- **Hosted instance:** `https://api.lelouch.indevs.in/v1` — Bearer / `x-api-key`: `Waguri` — supports `glm-5.2` — running in agent mode. OpenAI API recommended; Anthropic API is primitive.
 - Device tokens are **consumed and deleted** after use. Re-run `captcha.go` to replenish the pool. Each captcha computation tries up to **5 tokens**.
 - The default auth token (`Waguri`) is a placeholder — set `AUTH_TOKEN` in production.
 - `ZAI_TOKEN` bypasses guest initialization entirely. Without it, Z.AI's guest session typically only permits `glm-4.7`.
