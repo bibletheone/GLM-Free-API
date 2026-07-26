@@ -1756,7 +1756,7 @@ func sendToZAIStream(prompt string, opts struct {
             log.Println("[DEBUG] Z.AI request headers", string(hdrJSON))
         }
 
-        timeout := time.Duration(config.Timeouts.Default) * time.Millisecond
+        timeout := time.Duration(config.Timeouts.Default) * time.Millisecond * 2
         ctx, cancel := context.WithTimeout(context.Background(), timeout)
         req, err := http.NewRequestWithContext(ctx, "POST", urlStr, bytes.NewReader(bodyBytes))
         if err != nil {
