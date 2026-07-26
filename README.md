@@ -4,6 +4,54 @@ An OpenAI- **and Anthropic-compatible** API proxy for [chat.z.ai](https://chat.z
 
 ---
 
+## 🌐 Hosted Instance (Ready to Use)
+
+A public instance is already hosted on my servers. You can start using it immediately — no setup, no token collection, no `ZAI_TOKEN` required.
+
+| Setting | Value |
+|---|---|
+| **Base URL** | `https://api.lelouch.ndevs.in/v1` |
+| **Auth (Bearer / `x-api-key`)** | `Waguri` |
+| **Supported models** | `glm-5.2` (and others from the live model list) |
+| **Mode** | **Agent mode enabled** (tool-calling / function-calling is supported) |
+
+> **Note:** The server runs between 12:30 AM UTC to 3:30 PM UTC and restarts at interval of 6 hours
+> **⚠️ API recommendation:** The Anthropic-compatible `/v1/messages` endpoint is functional but considered **primitive** on this instance. The **OpenAI-compatible `/v1/chat/completions` endpoint is recommended** for the best experience — including streaming, thinking, and tool-use.
+
+### Quick start (OpenAI SDK)
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="https://api.lelouch.ndevs.in/v1",
+    api_key="Waguri",
+)
+
+resp = client.chat.completions.create(
+    model="glm-5.2",
+    messages=[{"role": "user", "content": "Hello, who are you?"}],
+)
+print(resp.choices[0].message.content)
+```
+
+### Quick start (curl)
+
+```bash
+curl -N -X POST https://api.lelouch.ndevs.in/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer Waguri" \
+  -d '{
+    "model": "glm-5.2",
+    "stream": true,
+    "messages": [{"role": "user", "content": "Write a haiku about Go."}]
+  }'
+```
+
+> The hosted instance is provided as-is for evaluation. For production or heavy workloads, self-host using the instructions below.
+
+---
+
 ## Features
 
 - **Dual protocol** — OpenAI `/v1/chat/completions` + Anthropic `/v1/messages` on the same server
@@ -119,6 +167,8 @@ On startup, you'll see a banner with your health URL, API endpoints, and auth to
 ---
 
 ## API Reference
+
+> **Reminder:** On the hosted instance (`api.lelouch.ndevs.in`), the **OpenAI endpoint is recommended**. The Anthropic endpoint works but is considered primitive.
 
 ### OpenAI-Compatible
 
@@ -297,6 +347,8 @@ curl -X POST http://localhost:3001/features \
 
 ## Agent Mode
 
+> The hosted instance at `api.lelouch.ndevs.in` is **already running in agent mode** — you can use tools/function-calling without any extra configuration.
+
 Z.AI's unofficial `/api/v2/chat/completions` endpoint only accepts messages with `role="user"`. System, assistant, and tool roles cause `INTERNAL_ERROR`. OpenAI-style `tools` / `tool_calls` are also rejected.
 
 When `AGENT_MODE` is enabled (via `--agent-mode` flag or `AGENT_MODE=true` env), the server performs three transformations:
@@ -321,7 +373,9 @@ Enabling agent mode also starts the **background captcha cache**, which pre-gene
 
 ## Examples
 
-All examples use `glm-4.7` so they work **without** `ZAI_TOKEN`.
+> The examples below use `localhost` for self-hosting. For the hosted instance, swap the base URL to `https://api.lelouch.ndevs.in/v1` and use `glm-5.2` — auth stays `Waguri`.
+
+All self-hosted examples use `glm-4.7` so they work **without** `ZAI_TOKEN`.
 
 **Basic non-streaming request (OpenAI)**
 
@@ -363,7 +417,7 @@ curl -N -X POST http://localhost:3001/v1/chat/completions \
   }'
 ```
 
-**Anthropic Messages API**
+**Anthropic Messages API** *(primitive on the hosted instance — OpenAI recommended)*
 
 ```bash
 curl -X POST http://localhost:3001/v1/messages \
@@ -393,7 +447,24 @@ curl -N -X POST http://localhost:3001/v1/messages \
   }'
 ```
 
-**Python (OpenAI SDK)**
+**Python (OpenAI SDK) — using the hosted instance**
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="https://api.lelouch.ndevs.in/v1",
+    api_key="Waguri",
+)
+
+resp = client.chat.completions.create(
+    model="glm-5.2",
+    messages=[{"role": "user", "content": "Hello!"}],
+)
+print(resp.choices[0].message.content)
+```
+
+**Python (OpenAI SDK) — self-hosted**
 
 ```python
 from openai import OpenAI
@@ -410,7 +481,7 @@ resp = client.chat.completions.create(
 print(resp.choices[0].message.content)
 ```
 
-**Python (Anthropic SDK)**
+**Python (Anthropic SDK)** *(primitive — OpenAI recommended)*
 
 ```python
 from anthropic import Anthropic
@@ -526,6 +597,7 @@ zai-api/
 
 ## Notes
 
+- **Hosted instance:** `https://api.lelouch.ndevs.in/v1` — Bearer / `x-api-key`: `Waguri` — supports `glm-5.2` — running in agent mode. OpenAI API recommended; Anthropic API is primitive.
 - Device tokens are **consumed and deleted** after use. Re-run `captcha.go` to replenish the pool. Each captcha computation tries up to **5 tokens**.
 - The default auth token (`Waguri`) is a placeholder — set `AUTH_TOKEN` in production.
 - `ZAI_TOKEN` bypasses guest initialization entirely. Without it, Z.AI's guest session typically only permits `glm-4.7`.
