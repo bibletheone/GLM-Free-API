@@ -2616,29 +2616,42 @@ func anthropicStreamResponse(w http.ResponseWriter, prompt string, opts SendOpti
                 })
                 outputTokens += estimateTokens(contentDelta)
             }
-            if len(toolCalls) > 0 {
-                for _, tc := range toolCalls {
+            for _, tc := range toolCalls {
+                fn, _ := tc["function"].(map[string]interface{})
+                argsStr, _ := fn["arguments"].(string)
+                if id, ok := tc["id"].(string); ok && id != "" {
+                    // Header delta — start new tool_use block
                     stopBlock()
-                    fn, _ := tc["function"].(map[string]interface{})
                     name, _ := fn["name"].(string)
-                    argsStr, _ := fn["arguments"].(string)
-                    id, _ := tc["id"].(string)
                     tooluID := "toolu_" + strings.TrimPrefix(id, "call_")
                     startBlock("tool_use", map[string]interface{}{
                         "id":    tooluID,
                         "name":  name,
                         "input": map[string]interface{}{},
                     })
-                    writeEvent("content_block_delta", map[string]interface{}{
-                        "type":  "content_block_delta",
-                        "index": blockIndex,
-                        "delta": map[string]interface{}{
-                            "type":         "input_json_delta",
-                            "partial_json": argsStr,
-                        },
-                    })
-                    stopBlock()
                     toolCallEmitted = true
+                    if argsStr != "" {
+                        writeEvent("content_block_delta", map[string]interface{}{
+                            "type":  "content_block_delta",
+                            "index": blockIndex,
+                            "delta": map[string]interface{}{
+                                "type":         "input_json_delta",
+                                "partial_json": argsStr,
+                            },
+                        })
+                    }
+                } else {
+                    // Arguments delta — emit partial JSON
+                    if argsStr != "" {
+                        writeEvent("content_block_delta", map[string]interface{}{
+                            "type":  "content_block_delta",
+                            "index": blockIndex,
+                            "delta": map[string]interface{}{
+                                "type":         "input_json_delta",
+                                "partial_json": argsStr,
+                            },
+                        })
+                    }
                 }
             }
         } else {
@@ -2678,29 +2691,42 @@ func anthropicStreamResponse(w http.ResponseWriter, prompt string, opts SendOpti
 
         if !toolCallEmitted {
             toolCalls := extractAgentToolCalls(fullContent)
-            if len(toolCalls) > 0 {
-                for _, tc := range toolCalls {
+            for _, tc := range toolCalls {
+                fn, _ := tc["function"].(map[string]interface{})
+                argsStr, _ := fn["arguments"].(string)
+                if id, ok := tc["id"].(string); ok && id != "" {
+                    // Header delta — start new tool_use block
                     stopBlock()
-                    fn, _ := tc["function"].(map[string]interface{})
                     name, _ := fn["name"].(string)
-                    argsStr, _ := fn["arguments"].(string)
-                    id, _ := tc["id"].(string)
                     tooluID := "toolu_" + strings.TrimPrefix(id, "call_")
                     startBlock("tool_use", map[string]interface{}{
                         "id":    tooluID,
                         "name":  name,
                         "input": map[string]interface{}{},
                     })
-                    writeEvent("content_block_delta", map[string]interface{}{
-                        "type":  "content_block_delta",
-                        "index": blockIndex,
-                        "delta": map[string]interface{}{
-                            "type":         "input_json_delta",
-                            "partial_json": argsStr,
-                        },
-                    })
-                    stopBlock()
                     toolCallEmitted = true
+                    if argsStr != "" {
+                        writeEvent("content_block_delta", map[string]interface{}{
+                            "type":  "content_block_delta",
+                            "index": blockIndex,
+                            "delta": map[string]interface{}{
+                                "type":         "input_json_delta",
+                                "partial_json": argsStr,
+                            },
+                        })
+                    }
+                } else {
+                    // Arguments delta — emit partial JSON
+                    if argsStr != "" {
+                        writeEvent("content_block_delta", map[string]interface{}{
+                            "type":  "content_block_delta",
+                            "index": blockIndex,
+                            "delta": map[string]interface{}{
+                                "type":         "input_json_delta",
+                                "partial_json": argsStr,
+                            },
+                        })
+                    }
                 }
             }
         }
@@ -3392,10 +3418,103 @@ type agentStreamInterceptor struct {
     flushed   int  // offset into buf that has been processed
     emitting  bool // currently inside a tool-call block
     callIndex int
+
+    // Streaming tool-call state (incremental args streaming)
+    tcNameFound    bool
+    tcName         string
+    tcId           string
+    tcArgsFound    bool // found "arguments": and value start
+    tcArgsPos      int  // absolute byte offset in buf where args value starts
+    tcArgsStreamed int  // bytes of args value already streamed
+    tcBraceDepth   int  // brace depth for tracking args object end
+    tcInString     bool // inside a string in args
+    tcEscapeNext   bool // next char is escaped in args
+    tcArgsDone     bool // args object fully streamed
+    tcFallback     bool // fallback to buffered mode
 }
 
 func newAgentStreamInterceptor() *agentStreamInterceptor {
     return &agentStreamInterceptor{callIndex: -1}
+}
+
+// resetToolCallState clears streaming tool-call state for the next call.
+func (a *agentStreamInterceptor) resetToolCallState() {
+    a.tcNameFound = false
+    a.tcName = ""
+    a.tcId = ""
+    a.tcArgsFound = false
+    a.tcArgsPos = 0
+    a.tcArgsStreamed = 0
+    a.tcBraceDepth = 0
+    a.tcInString = false
+    a.tcEscapeNext = false
+    a.tcArgsDone = false
+    a.tcFallback = false
+}
+
+// tryExtractName extracts the "name" field value from partial JSON.
+// Returns the name and byte offset after closing quote, or "" and -1.
+// Only searches before "arguments" key to avoid matching nested keys.
+func tryExtractName(text string) (string, int) {
+    searchEnd := len(text)
+    if argsIdx := strings.Index(text, `"arguments"`); argsIdx >= 0 {
+        searchEnd = argsIdx
+    }
+    keyIdx := strings.Index(text[:searchEnd], `"name"`)
+    if keyIdx < 0 {
+        return "", -1
+    }
+    pos := keyIdx + len(`"name"`)
+    for pos < len(text) && (text[pos] == ' ' || text[pos] == '\t' || text[pos] == '\n' || text[pos] == '\r') {
+        pos++
+    }
+    if pos >= len(text) || text[pos] != ':' {
+        return "", -1
+    }
+    pos++
+    for pos < len(text) && (text[pos] == ' ' || text[pos] == '\t' || text[pos] == '\n' || text[pos] == '\r') {
+        pos++
+    }
+    if pos >= len(text) || text[pos] != '"' {
+        return "", -1
+    }
+    pos++
+    nameStart := pos
+    for pos < len(text) {
+        if text[pos] == '"' && (pos == 0 || text[pos-1] != '\\') {
+            return text[nameStart:pos], pos + 1
+        }
+        pos++
+    }
+    return "", -1
+}
+
+// findArgsStart finds the start position of the "arguments" value in partial JSON.
+// Only returns a position if the value starts with '{' (object arguments).
+// Returns -1 if not found or not enough data yet.
+func findArgsStart(text string) int {
+    keyIdx := strings.Index(text, `"arguments"`)
+    if keyIdx < 0 {
+        return -1
+    }
+    pos := keyIdx + len(`"arguments"`)
+    for pos < len(text) && (text[pos] == ' ' || text[pos] == '\t' || text[pos] == '\n' || text[pos] == '\r') {
+        pos++
+    }
+    if pos >= len(text) || text[pos] != ':' {
+        return -1
+    }
+    pos++
+    for pos < len(text) && (text[pos] == ' ' || text[pos] == '\t' || text[pos] == '\n' || text[pos] == '\r') {
+        pos++
+    }
+    if pos >= len(text) {
+        return -1
+    }
+    if text[pos] != '{' {
+        return -1 // non-object args -> use fallback
+    }
+    return pos
 }
 
 // feed accepts a new chunk of assistant text and returns:
@@ -3408,54 +3527,183 @@ func (a *agentStreamInterceptor) feed(chunk string) (contentDelta string, toolCa
 
     for {
         if a.emitting {
-            // Look for end marker in unprocessed portion
-            endIdx := strings.Index(data[a.flushed:], agentToolCallEnd)
-            if endIdx < 0 {
-                // Not yet complete; hold everything.
-                return
+            rawData := data[a.flushed:]
+            endIdx := strings.Index(rawData, agentToolCallEnd)
+
+            var complete bool
+            var jsonEnd int
+            if endIdx >= 0 {
+                complete = true
+                jsonEnd = endIdx
+            } else {
+                jsonEnd = len(rawData)
             }
-            // Find the matching start marker (most recent before flushed)
-            absStart := strings.LastIndex(data[:a.flushed], agentToolCallStart)
-            if absStart < 0 {
-                // Orphan end marker; skip it
+
+            jsonText := rawData[:jsonEnd]
+
+            // ── Fallback mode: buffer everything, parse at end ──
+            if a.tcFallback {
+                if !complete {
+                    return
+                }
+                jsonRegion := strings.TrimSpace(jsonText)
+                jsonRegion = strings.TrimPrefix(jsonRegion, "```json")
+                jsonRegion = strings.TrimPrefix(jsonRegion, "```")
+                jsonRegion = strings.TrimSuffix(jsonRegion, "```")
+                jsonRegion = strings.TrimSpace(jsonRegion)
+                var parsed map[string]interface{}
+                if err := json.Unmarshal([]byte(jsonRegion), &parsed); err == nil {
+                    name, _ := parsed["name"].(string)
+                    args := parsed["arguments"]
+                    if args == nil {
+                        args = map[string]interface{}{}
+                    }
+                    argsJSON, _ := json.Marshal(args)
+                    a.callIndex++
+                    toolCalls = append(toolCalls, map[string]interface{}{
+                        "index": a.callIndex,
+                        "id":    fmt.Sprintf("call_%s_%d", generateID()[:8], a.callIndex),
+                        "type":  "function",
+                        "function": map[string]interface{}{
+                            "name":      name,
+                            "arguments": string(argsJSON),
+                        },
+                    })
+                    finishToolCalls = true
+                }
+                a.resetToolCallState()
                 a.emitting = false
                 a.flushed += endIdx + len(agentToolCallEnd)
+                for a.flushed < len(data) && (data[a.flushed] == '\n' || data[a.flushed] == '\r') {
+                    a.flushed++
+                }
                 continue
             }
-            jsonRegion := strings.TrimSpace(data[absStart+len(agentToolCallStart) : a.flushed+endIdx])
-            // Strip accidental code fences
-            jsonRegion = strings.TrimPrefix(jsonRegion, "```json")
-            jsonRegion = strings.TrimPrefix(jsonRegion, "```")
-            jsonRegion = strings.TrimSuffix(jsonRegion, "```")
-            jsonRegion = strings.TrimSpace(jsonRegion)
 
-            var parsed map[string]interface{}
-            if err := json.Unmarshal([]byte(jsonRegion), &parsed); err == nil {
-                name, _ := parsed["name"].(string)
-                args := parsed["arguments"]
-                if args == nil {
-                    args = map[string]interface{}{}
+            // ── Streaming mode ──
+
+            // Phase 1: Extract and emit name header
+            if !a.tcNameFound {
+                name, _ := tryExtractName(jsonText)
+                if name != "" {
+                    a.tcName = name
+                    a.tcNameFound = true
+                    a.callIndex++
+                    a.tcId = fmt.Sprintf("call_%s_%d", generateID()[:8], a.callIndex)
+                    toolCalls = append(toolCalls, map[string]interface{}{
+                        "index": a.callIndex,
+                        "id":    a.tcId,
+                        "type":  "function",
+                        "function": map[string]interface{}{
+                            "name":      name,
+                            "arguments": "",
+                        },
+                    })
+                } else if !complete {
+                    return
                 }
-                argsJSON, _ := json.Marshal(args)
-                a.callIndex++
-                toolCalls = append(toolCalls, map[string]interface{}{
-                    "index": a.callIndex,
-                    "id":    fmt.Sprintf("call_%s_%d", generateID()[:8], a.callIndex),
-                    "type":  "function",
-                    "function": map[string]interface{}{
-                        "name":      name,
-                        "arguments": string(argsJSON),
-                    },
-                })
+            }
+
+            // Phase 2: Find arguments value start
+            if a.tcNameFound && !a.tcArgsFound && !a.tcArgsDone {
+                argsPos := findArgsStart(jsonText)
+                if argsPos >= 0 {
+                    a.tcArgsFound = true
+                    a.tcArgsPos = a.flushed + argsPos
+                    a.tcArgsStreamed = 0
+                    a.tcBraceDepth = 0
+                    a.tcInString = false
+                    a.tcEscapeNext = false
+                } else if !complete {
+                    return
+                } else {
+                    // Complete but no object args found — use fallback
+                    a.tcFallback = true
+                    continue
+                }
+            }
+
+            // Phase 3: Stream arguments bytes incrementally
+            if a.tcArgsFound && !a.tcArgsDone {
+                var streamEnd int
+                if complete {
+                    streamEnd = a.flushed + endIdx
+                } else {
+                    streamEnd = len(data)
+                }
+
+                argsText := data[a.tcArgsPos:streamEnd]
+                var argsDelta strings.Builder
+                i := a.tcArgsStreamed
+                for i < len(argsText) {
+                    c := argsText[i]
+                    if a.tcEscapeNext {
+                        a.tcEscapeNext = false
+                        argsDelta.WriteByte(c)
+                        i++
+                        continue
+                    }
+                    if c == '\\' {
+                        a.tcEscapeNext = true
+                        argsDelta.WriteByte(c)
+                        i++
+                        continue
+                    }
+                    if c == '"' {
+                        a.tcInString = !a.tcInString
+                        argsDelta.WriteByte(c)
+                        i++
+                        continue
+                    }
+                    if a.tcInString {
+                        argsDelta.WriteByte(c)
+                        i++
+                        continue
+                    }
+                    if c == '{' {
+                        a.tcBraceDepth++
+                    } else if c == '}' {
+                        a.tcBraceDepth--
+                        if a.tcBraceDepth == 0 {
+                            argsDelta.WriteByte(c)
+                            i++
+                            a.tcArgsDone = true
+                            break
+                        }
+                    }
+                    argsDelta.WriteByte(c)
+                    i++
+                }
+                a.tcArgsStreamed = i
+
+                if argsDelta.Len() > 0 {
+                    toolCalls = append(toolCalls, map[string]interface{}{
+                        "index": a.callIndex,
+                        "function": map[string]interface{}{
+                            "arguments": argsDelta.String(),
+                        },
+                    })
+                }
+            }
+
+            // Phase 4: Finalize on completion
+            if complete {
+                if !a.tcNameFound {
+                    // Name never extracted — try fallback parse
+                    a.tcFallback = true
+                    continue
+                }
+                a.resetToolCallState()
+                a.emitting = false
+                a.flushed += endIdx + len(agentToolCallEnd)
+                for a.flushed < len(data) && (data[a.flushed] == '\n' || data[a.flushed] == '\r') {
+                    a.flushed++
+                }
                 finishToolCalls = true
+                continue
             }
-            a.emitting = false
-            a.flushed += endIdx + len(agentToolCallEnd)
-            // Skip trailing newlines
-            for a.flushed < len(data) && (data[a.flushed] == '\n' || data[a.flushed] == '\r') {
-                a.flushed++
-            }
-            continue
+
+            return
         }
 
         // Not emitting — look for start marker
@@ -3480,6 +3728,7 @@ func (a *agentStreamInterceptor) feed(chunk string) (contentDelta string, toolCa
         // Advance past the start marker
         a.flushed += len(agentToolCallStart)
         a.emitting = true
+        a.resetToolCallState()
         // Skip trailing newline after start marker
         for a.flushed < len(data) && (data[a.flushed] == '\n' || data[a.flushed] == '\r') {
             a.flushed++
@@ -3699,7 +3948,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
         }
         toolCallEmitted := false
 
-        emitToolCallChunk := func(tc []map[string]interface{}) {
+        emitToolCallDelta := func(tc map[string]interface{}) {
             chunk := map[string]interface{}{
                 "id":      "chatcmpl-" + requestId,
                 "object":  "chat.completion.chunk",
@@ -3708,7 +3957,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
                 "choices": []map[string]interface{}{
                     {
                         "index":         0,
-                        "delta":         map[string]interface{}{"role": "assistant", "tool_calls": tc},
+                        "delta":         map[string]interface{}{"tool_calls": []map[string]interface{}{tc}},
                         "finish_reason": nil,
                     },
                 },
@@ -3795,8 +4044,8 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
                         c := formatOpenAIResponse(ResponseResult{Content: contentDelta}, model, requestId, true)
                         writeSSE(toJSON(c))
                     }
-                    if len(toolCalls) > 0 {
-                        emitToolCallChunk(toolCalls)
+                    for _, tc := range toolCalls {
+                        emitToolCallDelta(tc)
                         toolCallEmitted = true
                     }
                 } else {
@@ -3816,9 +4065,11 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
                 
                 // Safety net: fallback tool call extraction at stream end
                 if !toolCallEmitted {
-                    toolCalls := extractAgentToolCalls(fullContent)
-                    if len(toolCalls) > 0 {
-                        emitToolCallChunk(toolCalls)
+                    fallbackCalls := extractAgentToolCalls(fullContent)
+                    if len(fallbackCalls) > 0 {
+                        for _, tc := range fallbackCalls {
+                            emitToolCallDelta(tc)
+                        }
                         toolCallEmitted = true
                     }
                 }
