@@ -60,6 +60,7 @@ const (
     BASE_URL           = "https://chat.z.ai"
     SALT_KEY           = "key-@@@@)))()((9))-xxxx&&&%%%%%"
     DEFAULT_FE_VERSION = "prod-fe-1.0.185"
+    zaiUserAgent       = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " + "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 
 // ---------- Config struct (Z.AI) ----------
@@ -1492,6 +1493,7 @@ func initializeSession() error {
     headers := map[string]string{
         "Origin":       BASE_URL,
         "Referer":      BASE_URL + "/",
+        "User-Agent":       zaiUserAgent,
         "Content-Type": "application/json",
     }
 
@@ -1764,6 +1766,7 @@ func sendToZAIStream(prompt string, opts struct {
             return fmt.Errorf("Z.AI connection error: %s", err.Error())
         }
         req.Header.Set("authorization", "Bearer "+token)
+        req.Header.Set("User-Agent", zaiUserAgent)
         req.Header.Set("content-type", "application/json")
         req.Header.Set("x-fe-Version", feVersion)
         req.Header.Set("x-region", "overseas")
@@ -2973,6 +2976,7 @@ func fetchModelsFromZAI() []ModelInfo {
     }
     req.Header.Set("Accept", "application/json")
     req.Header.Set("authorization", "Bearer "+session.Token)
+    req.Header.Set("User-Agent", zaiUserAgent)
     resp, err := zaiHTTPClient.Do(req)
     if err != nil {
         logError("fetchModels do: " + err.Error())
