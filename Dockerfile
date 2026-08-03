@@ -1,9 +1,7 @@
 FROM golang:1.22-alpine AS builder
 WORKDIR /app
-COPY go.mod ./
-RUN go mod download
-RUN go mod download
 COPY . .
+RUN go mod init zai-api && go mod tidy
 RUN CGO_ENABLED=0 go build -ldflags="-s -w" -trimpath -o glm-api main.go
 
 FROM alpine:latest
