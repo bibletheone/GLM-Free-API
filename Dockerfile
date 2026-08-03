@@ -2,7 +2,7 @@ FROM golang:1.22-alpine AS builder
 WORKDIR /app
 COPY main.go captcha.go ./
 RUN printf 'module zai-api\n\ngo 1.22\n\nrequire modernc.org/sqlite v1.34.1\n' > go.mod
-RUN go mod tidy
+RUN go mod download
 RUN CGO_ENABLED=0 go build -ldflags="-s -w" -trimpath -o glm-api main.go
 
 FROM alpine:latest
