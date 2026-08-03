@@ -971,6 +971,7 @@ nd(13,[],undefined,undefined,false)
 ```
 SG_WEB#3795d28242a11619bc25f786f84e53d4-h-1782531783720-ac9e47a76eee443087943a278f191642##0#160d05bbafcaefb0aa5f74c6164a8a0e 
 ```
+The trailing 32 bit data is md5 and calculated by md5 = [tF, Q, blob, tC, secret].join('#') like this 'SG_WEB#3795d28242a11619bc25f786f84e53d4-h-1782531783720-ac9e47a76eee443087943a278f191642##0#daye,raolewoba!' then appends to it
 Looks like C is used to generate encrypted Data and C.GatherCount  is used to generate the GatherCount which is undefined so it sets to 0
 Is C the value of cK(tN, tv)?
 
