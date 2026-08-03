@@ -1,4 +1,31 @@
-**window.z_um.getToken Definition**
+# Fielin: window.z_um.getToken Reverse Engineering Report
+
+## Index
+
+- [1 window.z_um.getToken - Definition](#1-windowz_umgettoken---definition)
+- [2 Deobfuscation](#2-deobfuscation)
+- [3 Function cG](#3-function-cg)
+- [4 Function i return t holds deviceToken](#4-function-i-return-t-holds-devicetoken)
+- [5 VAR T RELATION](#5-var-t-relation)
+- [6 PAYLOA GEN](#6-payloa-gen)
+- [7 DEOBFUSCATION GENERATOR](#7-deobfuscation-generator)
+- [8 Function nD](#8-function-nd)
+- [9 Test](#9-test)
+  - [9.1 NORMAL DEVICE TOKEN:](#91-normal-device-token)
+  - [9.2 DECODED:](#92-decoded)
+  - [9.3 TEST CALL](#93-test-call)
+  - [9.4 RESULTED DECODED TOKEN:](#94-resulted-decoded-token)
+  - [9.5 Trailing MD5 component](#95-trailing-md5-component)
+  - [9.6 Payload array (variable d) before return a](#96-payload-array-variable-d-before-return-a)
+- [10 THE VARS IN THE ARRAY:](#10-the-vars-in-the-array)
+  - [`10.1 tF = Y[R]`](#101-tf--yr)
+  - [10.2 Q = tm](#102-q--tm)
+  - [10.3 w = rg(T, N)](#103-w--rgt-n)
+  - [10.4 tC = h](#104-tc--h)
+  - [`10.5 p = nK(F)[(tn(), tn)(1, 33)]()`](#105-p--nkftn-tn1-33)
+
+## 1 window.z_um.getToken - Definition
+
 ```js
 // For verify captcha t is certify id but it works even without that
 function st(t, r, e) {
@@ -22,8 +49,11 @@ function st(t, r, e) {
                 i += -7);
             return n
         }
+```
 
-# deobfuscation time
+## 2 Deobfuscation
+
+```js
 o = cG[[a][0](82, 41)](this, 46))
 o = cG.bind(this,46)
 n = o[u.C(a, 12 / (1 | a), 22 / (1 | a))](this, arguments)
@@ -34,8 +64,11 @@ a(12,22)
 o = cG.bind(this,46).apply(this,arguments)
 o = cG(46,arguments)
 st(t,r,e) = cG(46,t,r,e)
+```
 
-# Function cG
+## 3 Function cG
+
+```js
 function cG(t, r, e, n) {
             var i, a, o, c, s, f, l, h, d, v;
             for (a = 5; a; )
@@ -328,12 +361,11 @@ function cG(t, r, e, n) {
                 }
             return i
         }
-
 ```
 
-**Function i return t holds deviceToken**
+## 4 Function i return t holds deviceToken
+
 ```js
- i = function() {
                         var t, r, e, n, i, a, o, c, s, f, l, h, d, v, p, b, w, g, m, y, k, M, O, N, S, x, U, I, A, T, R, C, B, F, E, H, Y, q, J, z, j, P, L, V, D, Q, K, Z, G, X, _, W, $, tt, tr, te, tn, ti, ta, to, tu, tc, ts, tf, tl, th, td, tv, tp, tb, tw, tg, tm, ty, tk, tM, tO, tN, tS, tx, tU, tI, tA, tT, tR;
                         for (r = 112; r; )
                             switch (e = r >> 6,
@@ -600,18 +632,24 @@ function cG(t, r, e, n) {
                         return t
                     }(d, v, l))
 ```
-**VAR T RELATION**
+
+## 5 VAR T RELATION
+
 ```
 t = X
 X=v
 v = t8[J] = t8['DeviceToken']
 ```
-**PAYLOA GEN**
+
+## 6 PAYLOA GEN
+
 ```
 g = n5(C, null, null, h) // C = payload, h = false
 g = DeviceToken
 ```
-**DEOBFUSCATION GENERATOR**
+
+## 7 DEOBFUSCATION GENERATOR
+
 ```js
 function n5(t,r,e,n){function i(t,r){return(nV||nV)(t,r- -9)}return nD[i(91,18)](this,13)[(i&&i)(2,8)](this,arguments)}
 
@@ -629,7 +667,8 @@ nD.bind(this,13).apply(this,arguments)
 nD(13,arguments)
 ```
 
-**Function nD***
+## 8 Function nD
+
 ```js
 function nD(t, r, e, n, i) {
             var a, o, u, s, f, l, h, d, v, p, b, w, g, m, y, k, M, O, N, S, x, U, I, A, T, R, C, B, F, E, H, Y, q, J, z, j, P, L, V, D, Q, K, Z, G, X, _, W, $, tt, tr, te, tn, ti, ta, to, tu, tc, ts, tf, tl, th, td, tv, tp, tb, tw, tg, tm, ty, tk, tM, tO, tN, tS, tx, tU, tI, tA, tT, tR, tC, tB, tF, tE, tH, tY, tq, tJ;
@@ -949,35 +988,46 @@ function nD(t, r, e, n, i) {
                 }
             return a
         } 
-
 ```
 
-**Test**
+## 9 Test
 
-**NORMAL DEVICE TOKEN**:
+### 9.1 NORMAL DEVICE TOKEN:
+
 ```
 U0dfV0VCIzM3OTVkMjgyNDJhMTE2MTliYzI1Zjc4NmY4NGU1M2Q0LWgtMTc4MjUzMTc4MzcyMC1hYzllNDdhNzZlZWU0NDMwODc5NDNhMjc4ZjE5MTY0MiNXM0FTUGxXZmx2SWI1YlJWV2RpbnlJdHA1WXIwOGxVMTY1VEs3KzlTWGJYMmlOcTBLU0J3ZUJBTG1hMFlLaFhJNE5iUFVvLzVOeG0xSEsyemRXTHJXQUdGN3FXWWxhSW1xaEtsVkRzbEd4OXdhNnRSSGNIOFlBUWhtNVltWk14ZGM5cCsxSlRpM1FoVDg0YmYvREJpY0tWenZRS2haaUVPaExFM1hQaitCcmViblRzN1cycStBY1BvU2swdldRWnBSL1lIUE5qMkZ0bTRraTJKZnJ3NXNvMTFLTkw1QjN5ZERVbHpLbXV2Tnh0OHZYVHNOMHJtY1ZuRWluT1E1cjMvd2lOVkdrdHpsQ1k3VFR0YTAvUFpVa2VvM2M5N2F6d3dIbE1NZERENEhzREpkYmdTQzRmcE1idGovSGtoUGViWTRVK3orNHJHT3JDclRmSGV2UllyNFlxTGwzZFIvb1pHVFdhanBzRmhoTUoraThTNHN1bmlRZ1dmOXRnK1pMckg4b3hQNFl0TGpCOHZBdk10K1FPNjZSbGFuRjhsK08wZ2gvbVJ0Zmdla1pYaVN3TjdJTVc4dzhwRlE2d2RlOURUeS96Nk5wQ0xNemg3Mm1waHhyMnBHSGpBMTlHL1kweUw5OTBGa2hBNjY5eVJraUdVNWQxeTREWWxEZmNpemU4dVFWY1lLNituckhlSFVJcVlsajFCQjF6QzJvK3NRSmxsWmdORjMxYzNKMHZlRTFONGtyaTdJdzNnYTdsK3BIOWM1bnFVQmFXS1pNRnRvRHpSZnRHWUw4cWhHa0dWaVBadU9FTE0zYlQ3NWdIdmhQTGdsdkRNSmxmeE10Yk1teXZZTis3c2k1eHh2WjhNaFFMeG1VSUJDZ0NLVERrTGVNcm43Z3Y5bzBpaGNFT3JOTGJLZjh2R0VHMnIzSjhWR1pPVnRTSkNkMG53ak9JMlYyOTFSZ2NUazVOTmJWZWp1a2ZEdlNmNmU2eHE2ZjZBVkJpUWE3ZUszMnZVOXZtakVaeWw2d1owVFlTRGdMOVovaTVoQW5NSXJpdzB4aE55eFpVbWpTSThrVmtTRC9lRGg2R3A4UzM1MnlZOWkzZDB0T3FaMWoxWW5yUEZlelA4bmlhUi9ndklQdz09IzUyNCNkNzY5NDYwZDEzNWU3NzQzMTBkNjY1YzI5MmM0MWU5NQ==
 ```
-**DECODED**:
+
+### 9.2 DECODED:
+
 ```
 SG_WEB#3795d28242a11619bc25f786f84e53d4-h-1782531783720-ac9e47a76eee443087943a278f191642#W3ASPlWflvIb5bRVWdinyItp5Yr08lU165TK7+9SXbX2iNq0KSBweBALma0YKhXI4NbPUo/5Nxm1HK2zdWLrWAGF7qWYlaImqhKlVDslGx9wa6tRHcH8YAQhm5YmZMxdc9p+1JTi3QhT84bf/DBicKVzvQKhZiEOhLE3XPj+BrebnTs7W2q+AcPoSk0vWQZpR/YHPNj2Ftm4ki2Jfrw5so11KNL5B3ydDUlzKmuvNxt8vXTsN0rmcVnEinOQ5r3/wiNVGktzlCY7TTta0/PZUkeo3c97azwwHlMMdDD4HsDJdbgSC4fpMbtj/HkhPebY4U+z+4rGOrCrTfHevRYr4YqLl3dR/oZGTWajpsFhhMJ+i8S4suniQgWf9tg+ZLrH8oxP4YtLjB8vAvMt+QO66RlanF8l+O0gh/mRtfgekZXiSwN7IMW8w8pFQ6wde9DTy/z6NpCLMzh72mphxr2pGHjA19G/Y0yL990FkhA669yRkiGU5d1y4DYlDfcize8uQVcYK6+nrHeHUIqYlj1BB1zC2o+sQJllZgNF31c3J0veE1N4kri7Iw3ga7l+pH9c5nqUBaWKZMFtoDzRftGYL8qhGkGViPZuOELM3bT75gHvhPLglvDMJlfxMtbMmyvYN+7si5xxvZ8MhQLxmUIBCgCKTDkLeMrn7gv9o0ihcEOrNLbKf8vGEG2r3J8VGZOVtSJCd0nwjOI2V291RgcTk5NNbVejukfDvSf6e6xq6f6AVBiQa7eK32vU9vmjEZyl6wZ0TYSDgL9Z/i5hAnMIriw0xhNyxZUmjSI8kVkSD/eDh6Gp8S352yY9i3d0tOqZ1j1YnrPFezP8niaR/gvIPw==#524#d769460d135e774310d665c292c41e95
 ```
 
-**TEST CALL**
+### 9.3 TEST CALL
+
 ```js
 nd(13,[],undefined,undefined,false)
 ```
-**RESULTED DECODED TOKEN**:
+
+### 9.4 RESULTED DECODED TOKEN:
+
 ```
 SG_WEB#3795d28242a11619bc25f786f84e53d4-h-1782531783720-ac9e47a76eee443087943a278f191642##0#160d05bbafcaefb0aa5f74c6164a8a0e 
 ```
+
+### 9.5 Trailing MD5 component
+
 The trailing 32 bit data is md5 and calculated by md5 = [tF, Q, blob, tC, secret].join('#') like this 'SG_WEB#3795d28242a11619bc25f786f84e53d4-h-1782531783720-ac9e47a76eee443087943a278f191642##0#daye,raolewoba!' then appends to it
 Looks like C is used to generate encrypted Data and C.GatherCount  is used to generate the GatherCount which is undefined so it sets to 0
 Is C the value of cK(tN, tv)?
 
+### 9.6 Payload array (variable d) before return a
+
 **Before `return a` statement variable d (defined as: d = [tF, Q, w, tC, p]) holds the payload data**
 In case of normal call it was like this:
- ```js
+
+```
 [
     "SG_WEB",
     "3795d28242a11619bc25f786f84e53d4-h-1782531783720-ac9e47a76eee443087943a278f191642",
@@ -986,7 +1036,9 @@ In case of normal call it was like this:
     "0f9cdacd5f121f7c0a94c5a57a922b63"
 ]
 ```
+
 In case of our test call it was like this:
+
 ```
 [
     "SG_WEB",
@@ -997,11 +1049,11 @@ In case of our test call it was like this:
 ]
 ```
 
+## 10 THE VARS IN THE ARRAY:
 
-### THE VARS IN THE ARRAY:
+### 10.1 tF = Y[R]
 
-1. tF = Y[R]
-
+```js
 Y = t8[S.X(tn, [19, tn()][0], [39, tn()][0])]
 
 tn(19, 39) = WEB_REGION
@@ -1013,9 +1065,11 @@ Y = {"CN": "WEB","SG": "SG_WEB"}
 R = 'SG'
 
 tF = 'SG_WEB'
+```
 
-2. Q = tm
+### 10.2 Q = tm
 
+```js
 Q = tm
 
 tm = rm(tN, tR)
@@ -1039,9 +1093,11 @@ n(98,16)
 'sessionI'
 
 tR = t8['sessionId']
+```
 
-3. w = rg(T, N)
+### 10.3 w = rg(T, N)
 
+```js
 ts = rm(tB, g)
 
 tB = t8[tn.call(9, 48, 9)]
@@ -1070,13 +1126,16 @@ function n6(t, r) {
 }
 
 e.call(4,91,20) = 'bind', e.apply(9, [2, 10]) = 'apply'
+```
 
-4. tC = h
+### 10.4 tC = h
 
+```js
 h = b[tn.call(6, 38, 26)]
 
 r = b 
 
 h = b.GatherCost // 0 if b.gatherCost undefined
+```
 
-5. p = nK(F)[(tn(), tn)(1, 33)]()
+### 10.5 p = nK(F)[(tn(), tn)(1, 33)]() p = constant for md5 gen
