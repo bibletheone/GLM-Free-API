@@ -972,6 +972,7 @@ nd(13,[],undefined,undefined,false)
 SG_WEB#3795d28242a11619bc25f786f84e53d4-h-1782531783720-ac9e47a76eee443087943a278f191642##0#160d05bbafcaefb0aa5f74c6164a8a0e 
 ```
 Looks like C is used to generate encrypted Data and C.GatherCount  is used to generate the GatherCount which is undefined so it sets to 0
+Is C the value of cK(tN, tv)?
 
 **Before `return a` statement variable d (defined as: d = [tF, Q, w, tC, p]) holds the payload data**
 In case of normal call it was like this:
