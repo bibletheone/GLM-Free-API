@@ -3,7 +3,7 @@ WORKDIR /app
 COPY main.go captcha.go ./
 RUN printf 'module zai-api\n\ngo 1.22\n\nrequire modernc.org/sqlite v1.34.1\n' > go.mod
 RUN go mod download
-RUN CGO_ENABLED=0 go build -ldflags="-s -w" -trimpath -o glm-api main.go
+RUN CGO_ENABLED=0 go build -ldflags="-s -w" -trimpath -o glm-api .
 
 FROM alpine:latest
 RUN apk add --no-cache ca-certificates tzdata
