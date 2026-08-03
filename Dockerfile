@@ -1,14 +1,17 @@
-FROM golang:1.22-alpine AS builder
-WORKDIR /app
-COPY main.go captcha.go ./
-RUN go mod init zai-api && go get modernc.org/sqlite && go mod tidy
-RUN CGO_ENABLED=0 go build -ldflags="-s -w" -trimpath -o glm-api .
+FROM golang:1.23-bookworm AS builder
+WORKDIR /src
+COPY go.mod ./
+RUN go mod download
+COPY . .
+RUN go build -trimpath -ldflags="-s -w" -o /zai-api main.go
 
-FROM alpine:latest
-RUN apk add --no-cache ca-certificates tzdata
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates sqlite3 && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-COPY --from=builder /app/glm-api .
-EXPOSE 3001
-ENV PORT=3001
-ENV HOST=0.0.0.0
-CMD ["./glm-api"]
+COPY --from=builder /zai-api /app/zai-api
+# tokens.sqlite از طریق GitHub Actions commit می‌شه
+COPY tokens.sqlite /app/tokens.sqlite
+EXPOSE 8080
+ENV PORT=8080 HOST=0.0.0.0
+ENTRYPOINT ["/app/zai-api"]
