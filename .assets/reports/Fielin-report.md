@@ -23,7 +23,7 @@ function st(t, r, e) {
             return n
         }
 
-
+# deobfuscation time
 o = cG[[a][0](82, 41)](this, 46))
 o = cG.bind(this,46)
 n = o[u.C(a, 12 / (1 | a), 22 / (1 | a))](this, arguments)
@@ -33,6 +33,7 @@ a(12,22)
 'apply'
 o = cG.bind(this,46).apply(this,arguments)
 o = cG(46,arguments)
+st(t,r,e) = cG(46,t,r,e)
 
 # Function cG
 function cG(t, r, e, n) {
