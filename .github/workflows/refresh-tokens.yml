@@ -1,0 +1,30 @@
+name: Refresh Token Pool
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  harvest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+      - name: Init Go module
+        run: |
+          if [ ! -f go.mod ]; then go mod init zai-api; fi
+          go mod tidy
+      - name: Install Playwright + Chromium
+        run: |
+          go run github.com/playwright-community/playwright-go/cmd/playwright@latest install --with-deps chromium
+      - name: Run captcha collector
+        run: go run captcha.go --unsafe --no-tui
+      - name: Commit tokens.sqlite
+        uses: EndBug/add-and-commit@v10
+        with:
+          add: 'tokens.sqlite'
+          message: 'chore: refresh token pool [skip ci]'
+          default_author: github_actions
