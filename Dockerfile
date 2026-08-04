@@ -4,21 +4,16 @@ WORKDIR /src
 # کل سورس رو کپی کن
 COPY . .
 
-# captcha.go رو حذف کن
+# captcha.go رو حذف کن — به Playwright نیاز داره و توی سرور کاربردی نداره
 RUN rm -f captcha.go
 
-# go.mod حداقلی رو دستی بساز
-RUN go mod init zai-api
+# go.mod رو دستی بساز با تنها وابستگی واقعی
+RUN printf 'module zai-api\n\ngo 1.23\n\nrequire modernc.org/sqlite v1.34.5\n' > go.mod
 
-# وابستگی‌ها رو دستی add کن (بدون tidy)
-RUN go get github.com/labstack/echo/v4 || true
-RUN go get github.com/labstack/echo/v4/middleware || true
-RUN go get modernc.org/sqlite || true
-RUN go get github.com/charmbracelet/bubbletea || true
-RUN go get github.com/charmbracelet/bubbles || true
-RUN go get github.com/charmbracelet/lipgloss || true
+# وابستگی‌های transitif رو دانلود کن
+RUN go mod tidy
 
-# بیلد کن — اگه وابستگی کم باشه، ارور می‌ده و لیستش رو می‌بینیم
+# بیلد کن
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /zai-api main.go
 
 # --- Runtime Image ---
@@ -26,7 +21,11 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+
+# باینری رو کپی کن
 COPY --from=builder /zai-api /app/zai-api
+
+# tokens.sqlite — اگه توی repo نبود، یه فایل خالی بساز
 RUN touch /app/tokens.sqlite
 COPY --from=builder /src/tokens.sqlite* /app/tokens.sqlite
 
