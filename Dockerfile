@@ -4,13 +4,16 @@ WORKDIR /src
 # کل سورس رو کپی کن
 COPY . .
 
+# captcha.go رو حذف کن چون به Playwright نیاز داره و تو سرور کاربردی نداره
+RUN rm -f captcha.go
+
 # اگه go.mod وجود نداشت، خودش بساز
 RUN if [ ! -f go.mod ]; then go mod init zai-api; fi
 
-# وابستگی‌ها رو دانلود و تنظیم کن
+# وابستگی‌ها رو دانلود و تنظیم کن (حالا فقط وابستگی‌های main.go رو می‌گیره)
 RUN go mod tidy
 
-# فقط main.go رو بیلد کن (بدون captcha.go)
+# فقط main.go رو بیلد کن
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /zai-api main.go
 
 # --- Runtime Image ---
