@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: glm-free-api
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: AUTH_TOKEN
+        generateValue: true
+      - key: ZAI_TOKEN
+        sync: false
+      - key: AGENT_MODE
+        value: "true"
+      - key: LOG_LEVEL
+        value: "info"
+      - key: HOST
+        value: "0.0.0.0"
+    healthCheckPath: /health
+    autoDeploy: true
