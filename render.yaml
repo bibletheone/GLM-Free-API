@@ -1,9 +1,10 @@
 services:
   - type: web
     name: glm-free-api
-    runtime: docker
+    env: docker
     plan: free
     dockerfilePath: ./Dockerfile
+    dockerContext: .
     envVars:
       - key: AUTH_TOKEN
         generateValue: true
@@ -13,7 +14,5 @@ services:
         value: "true"
       - key: LOG_LEVEL
         value: "info"
-      - key: HOST
-        value: "0.0.0.0"
     healthCheckPath: /health
     autoDeploy: true
