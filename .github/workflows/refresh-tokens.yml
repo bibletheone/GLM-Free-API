@@ -16,7 +16,7 @@ jobs:
       - name: Init Go module
         run: |
           go mod init zai-api || true
-          go get github.com/playwright-community/playwright-go
+          go get github.com/mxschmitt/playwright-go
           go get github.com/charmbracelet/bubbletea
           go get github.com/charmbracelet/bubbles
           go get github.com/charmbracelet/lipgloss
