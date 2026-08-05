@@ -40,7 +40,7 @@ import (
     "sync"
     "sync/atomic"
     "time"
-
+    "unicode/utf8"
     _ "modernc.org/sqlite"
 )
 
@@ -2078,16 +2078,30 @@ func streamSSEResponse(body io.Reader, ch chan<- ZAIResult) error {
 
         if data, ok := j["data"].(map[string]interface{}); ok {
             if ec, ok := data["edit_content"].(string); ok && ec != "" {
+                // edit_content = FULL replacement starting at edit_index
                 editIndex := -1
                 if ei, ok := data["edit_index"].(float64); ok {
                     editIndex = int(ei)
                 }
                 current := fullText.String()
                 if editIndex >= 0 {
-                    // edit_index is a BYTE offset, use it directly
+                    // Convert rune-based edit_index to byte offset
+                    byteIdx := 0
+                    runeCount := 0
+                    for byteIdx < len(current) {
+                        if runeCount == editIndex {
+                            break
+                        }
+                        _, size := utf8.DecodeRuneInString(current[byteIdx:])
+                        byteIdx += size
+                        runeCount++
+                    }
+                    editIndex = byteIdx
+
                     if editIndex <= len(current) {
                         current = current[:editIndex] + ec
                     } else {
+                        // Z.AI index beyond current length — pad
                         for len(current) < editIndex {
                             current += " "
                         }
