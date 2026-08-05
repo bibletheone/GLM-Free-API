@@ -1737,7 +1737,7 @@ func sendToZAIStream(prompt string, opts struct {
             "chat_id":              opts.ChatID,
             "messages":             messagesField,
             "signature_prompt":     prompt,
-            "stream":               false, // Changed to false to fix UTF-8
+            "stream":               true, // Changed to false to fix UTF-8
             "captcha_verify_param": captchaParam,
             "features":             featuresPayload,
         }
@@ -1981,39 +1981,17 @@ func statusFromError(errMsg string) int {
     }
 }
 
-// safeUTF8Delta ensures we don't cut multi-byte UTF-8 characters in half
-func safeUTF8Delta(fullContent string, sentLen int) (delta string, newSentLen int) {
-    if len(fullContent) <= sentLen {
-        return "", sentLen
-    }
-    start := sentLen
-    for start > 0 && start < len(fullContent) && fullContent[start]&0xC0 == 0x80 {
-        start--
-    }
-    end := len(fullContent)
-    for end > start {
-        r, size := utf8.DecodeLastRuneInString(fullContent[start:end])
-        if r == utf8.RuneError && size == 1 {
-            end--
-        } else {
-            break
-        }
-    }
-    return fullContent[start:end], end
-}
+
 
 
 func streamSSEResponse(body io.Reader, ch chan<- ZAIResult) error {
     scanner := bufio.NewScanner(body)
     scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
 
-    // ── Accumulated state across SSE lines ──
     var fullText strings.Builder
     sentLen := 0
     sentReasoning := 0
 
-    // stripDetailsTags removes <details ...> and </details> wrappers
-    // and leading "> " markdown-quote prefixes from each line.
     stripDetailsTags := func(s string) string {
         if idx := strings.Index(s, "<details"); idx >= 0 {
             if end := strings.Index(s[idx:], ">"); end >= 0 {
@@ -2031,7 +2009,6 @@ func streamSSEResponse(body io.Reader, ch chan<- ZAIResult) error {
     flush := func() {
         raw := fullText.String()
 
-        // Split <details ...> ... </details> into reasoning vs content
         var reasoning, content string
         if idx := strings.Index(raw, "<details"); idx >= 0 {
             if tagEnd := strings.Index(raw[idx:], ">"); tagEnd >= 0 {
@@ -2040,12 +2017,11 @@ func streamSSEResponse(body io.Reader, ch chan<- ZAIResult) error {
                     reasoning = afterTag[:closeIdx]
                     content = raw[:idx] + afterTag[closeIdx+len("</details>"):]
                 } else {
-                    // <details> opened but not yet closed
                     reasoning = afterTag
                     content = raw[:idx]
                 }
             } else {
-                content = raw // tag not complete yet
+                content = raw
             }
         } else {
             content = raw
@@ -2055,20 +2031,18 @@ func streamSSEResponse(body io.Reader, ch chan<- ZAIResult) error {
             reasoning = stripDetailsTags(reasoning)
         }
 
-        // Emit content delta
         if len(content) > sentLen {
-            cDelta, cNewLen := safeUTF8Delta(content, sentLen)
-            ch <- ZAIResult{Chunk: cDelta, FullText: content}
-            sentLen = cNewLen
+            delta := content[sentLen:]
+            ch <- ZAIResult{Chunk: delta, FullText: content}
+            sentLen = len(content)
         } else if len(content) < sentLen {
             sentLen = len(content)
         }
 
-        // Emit reasoning delta
         if len(reasoning) > sentReasoning {
-            rDelta, rNewLen := safeUTF8Delta(reasoning, sentReasoning)
-            ch <- ZAIResult{Reasoning: rDelta}
-            sentReasoning = rNewLen
+            delta := reasoning[sentReasoning:]
+            ch <- ZAIResult{Reasoning: delta}
+            sentReasoning = len(reasoning)
         } else if len(reasoning) < sentReasoning {
             sentReasoning = len(reasoning)
         }
@@ -2077,10 +2051,6 @@ func streamSSEResponse(body io.Reader, ch chan<- ZAIResult) error {
     for scanner.Scan() {
         line := scanner.Text()
         trimmed := strings.TrimSpace(line)
-
-        if config.Logging.Level == "debug" && trimmed != "" {
-            log.Println("[DEBUG] Z.AI SSE line:", trimmed)
-        }
 
         if !strings.HasPrefix(trimmed, "data: ") {
             continue
@@ -2093,17 +2063,10 @@ func streamSSEResponse(body io.Reader, ch chan<- ZAIResult) error {
 
         var j map[string]interface{}
         if err := json.Unmarshal([]byte(dataStr), &j); err != nil {
-            if config.Logging.Level == "debug" {
-                log.Println("[DEBUG] Z.AI failed to parse SSE:", dataStr)
-            }
             continue
         }
 
-        // ── Detect inline errors (HTTP 200 with error in body) ──
         if errDetail := extractZAIError(j); errDetail != "" {
-            if config.Logging.Level == "debug" {
-                log.Println("[DEBUG] Z.AI inline SSE error:", errDetail)
-            }
             return fmt.Errorf("Z.AI error: %s", errDetail)
         }
 
@@ -2114,17 +2077,14 @@ func streamSSEResponse(body io.Reader, ch chan<- ZAIResult) error {
             }
         }
 
-        // ── Content accumulation ──
         if data, ok := j["data"].(map[string]interface{}); ok {
             if ec, ok := data["edit_content"].(string); ok && ec != "" {
-                // edit_content = FULL replacement starting at edit_index
                 editIndex := -1
                 if ei, ok := data["edit_index"].(float64); ok {
                     editIndex = int(ei)
                 }
                 current := fullText.String()
                 if editIndex >= 0 {
-                    // Convert rune-based edit_index to byte offset
                     byteIdx := 0
                     runeCount := 0
                     for byteIdx < len(current) {
@@ -2136,11 +2096,9 @@ func streamSSEResponse(body io.Reader, ch chan<- ZAIResult) error {
                         runeCount++
                     }
                     editIndex = byteIdx
-
                     if editIndex <= len(current) {
                         current = current[:editIndex] + ec
                     } else {
-                        // Z.AI index beyond current length — pad
                         for len(current) < editIndex {
                             current += " "
                         }
@@ -2164,6 +2122,7 @@ func streamSSEResponse(body io.Reader, ch chan<- ZAIResult) error {
     flush()
     return scanner.Err()
 }
+
 
 // ============================================================================
 // FORMAT HELPERS
@@ -2718,11 +2677,8 @@ func anthropicStreamResponse(w http.ResponseWriter, prompt string, opts SendOpti
         if len(fullContent) <= len(sentContent) {
             continue
         }
-        delta, newLen := safeUTF8Delta(fullContent, len(sentContent))
-        if delta == "" {
-            continue
-        }
-        sentContent = fullContent[:newLen]
+        delta := fullContent[len(sentContent):]
+        sentContent = fullContent
 
         if interceptor != nil {
             contentDelta, toolCalls, _ := interceptor.feed(delta)
@@ -4161,11 +4117,8 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
                 if len(fullContent) <= len(sentContent) {
                     continue
                 }
-                delta, newLen := safeUTF8Delta(fullContent, len(sentContent))
-                if delta == "" {
-                    continue
-                }
-                sentContent = fullContent[:newLen]
+                delta := fullContent[len(sentContent):]
+                sentContent = fullContent
 
                 if interceptor != nil {
                     contentDelta, toolCalls, _ := interceptor.feed(delta)
