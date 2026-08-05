@@ -1,6 +1,13 @@
 // main.go
 // Merged: Z.AI Direct Bridge + In-Memory Captcha Verification
 //
+// Combines:
+//   1. Aliyun captcha verification parameter generator (previously FIFO-based server)
+//   2. Z.AI Direct Bridge HTTP server
+//
+// The captcha_verify_param is now computed in-memory via direct function calls,
+// eliminating FIFO/named pipe overhead for maximum speed.
+//
 // compile using: go build -trimpath -ldflags="-s -w" -gcflags="all=-l=4" -o zai-bridge .
 
 package main
@@ -43,16 +50,20 @@ import (
 // ============================================================================
 
 const (
+    // Aliyun captcha credentials
     accessKey       = "LTAI5tSEBwYMwVKAQGpxmvTd"
     secretKey       = "YSKfst7GaVkXwZYvVihJsKF9r89koz"
     sceneID         = "didk33e0"
     maxTokenRetries = 5
 
+    // Z.AI direct config
     BASE_URL           = "https://chat.z.ai"
     SALT_KEY           = "key-@@@@)))()((9))-xxxx&&&%%%%%"
     DEFAULT_FE_VERSION = "prod-fe-1.0.185"
     zaiUserAgent       = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " + "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
+
+// ---------- Config struct (Z.AI) ----------
 
 type Config struct {
     Server struct {
@@ -130,6 +141,8 @@ var config = loadConfig()
 // TYPE DEFINITIONS
 // ============================================================================
 
+// ---------- Z.AI types ----------
+
 type Features struct {
     WebSearch     bool `json:"webSearch"`
     AutoWebSearch bool `json:"autoWebSearch"`
@@ -173,7 +186,7 @@ type SendOptions struct {
     ChatID            string
     Messages          []Message
     ClientMessagesRaw json.RawMessage
-    ReasoningEffort   string
+    ReasoningEffort   string // "high" or "max"; only forwarded if model supports it
 }
 
 type ResponseResult struct {
@@ -236,6 +249,8 @@ type Track struct {
 // GLOBAL STATE
 // ============================================================================
 
+// ---------- Captcha globals ----------
+
 var (
     dbPath   string
     verbose  bool
@@ -245,12 +260,14 @@ var (
     globalDB *sql.DB
 )
 
+// ---------- Z.AI globals ----------
+
 var session = &SessionState{
     ChatID:    randomUUID(),
     UserName:  "Guest",
     SaltKey:   SALT_KEY,
     FeVersion: DEFAULT_FE_VERSION,
-    Features:  Features{Thinking: true},
+    Features:  Features{Thinking: true}, // enable_thinking on by default
 }
 
 type ModelInfo struct {
@@ -268,6 +285,7 @@ var (
 
 const modelsCacheTTL = 5 * time.Minute
 
+// Fallback if Z.AI API is unreachable and cache is empty
 var fallbackModels = []ModelInfo{
     {ID: "glm-5.2", Name: "GLM-5.2", Description: "Flagship model, excels at coding and long-horizon tasks"},
     {ID: "GLM-5.1", Name: "GLM-5.1", Description: "Previous flagship model"},
@@ -278,8 +296,11 @@ var fallbackModels = []ModelInfo{
 
 var feVersionRe = regexp.MustCompile(`prod-fe-\d+\.\d+\.\d+`)
 
-// ---------- Per-model feature state ----------
+// ---------- Per-model feature state (dynamic, model-aware) ----------
 
+// ModelFeatureState tracks per-model feature configuration.
+// IncludeAll: when true, ALL server capabilities are sent to /completions.
+// Overrides: user-supplied per-model feature overrides (snake_case keys).
 type ModelFeatureState struct {
     IncludeAll bool
     Overrides  map[string]interface{}
@@ -290,6 +311,9 @@ var (
     modelFeatureStatesMu sync.Mutex
 )
 
+// normalizeFeatureKey converts a camelCase key to snake_case.
+// No alias mapping — users must use the real server capability key name.
+// Special handling for reasoning/thinking -> enable_thinking is done in featuresHandler.
 func normalizeFeatureKey(k string) string {
     var sb strings.Builder
     for i, r := range k {
@@ -305,6 +329,7 @@ func normalizeFeatureKey(k string) string {
     return sb.String()
 }
 
+// getModelFeatureState returns the per-model state, creating it if necessary.
 func getModelFeatureState(modelID string) *ModelFeatureState {
     modelFeatureStatesMu.Lock()
     defer modelFeatureStatesMu.Unlock()
@@ -319,6 +344,15 @@ func getModelFeatureState(modelID string) *ModelFeatureState {
     return s
 }
 
+// resolveFeaturesForModel computes the final feature map for /completions.
+//
+// Rules:
+//   - By default, auto_web_search and web_search are NOT included.
+//   - enable_thinking defaults to true for all models.
+//   - 'think' is never included — only enable_thinking reaches the request.
+//   - IncludeAll: include ALL server capabilities.
+//   - User overrides always take precedence.
+//   - image_generation is ALWAYS forced to false.
 func resolveFeaturesForModel(modelID string) map[string]interface{} {
     caps := getModelCapabilities(modelID)
     modelFeatureStatesMu.Lock()
@@ -333,10 +367,21 @@ func resolveFeaturesForModel(modelID string) map[string]interface{} {
     return resolveFeaturesWithState(caps, state)
 }
 
+// resolveFeaturesWithState does the actual resolution given caps + state.
+//
+// Rules:
+//   - By default, auto_web_search and web_search are NOT included.
+//   - enable_thinking defaults to true for all models.
+//   - 'think' is never included — only enable_thinking reaches the request.
+//   - User overrides always take precedence.
+//   - image_generation is ALWAYS forced to false.
 func resolveFeaturesWithState(caps map[string]interface{}, state *ModelFeatureState) map[string]interface{} {
     result := make(map[string]interface{})
 
     if state.IncludeAll {
+        // Include ALL server capabilities except reasoning_effort
+        // (reasoning_effort in capabilities is a boolean support flag,
+        //  not an actual feature value — handled separately per-request)
         for k, v := range caps {
             if k == "reasoning_effort" {
                 continue
@@ -344,18 +389,27 @@ func resolveFeaturesWithState(caps map[string]interface{}, state *ModelFeatureSt
             result[k] = v
         }
     }
+    // By default: no auto_web_search, no web_search, no think.
+    // enable_thinking defaults to true (set below).
 
+    // Apply user overrides (per-model stored overrides take precedence)
     for k, v := range state.Overrides {
         result[k] = v
     }
 
+    // Defensive: reasoning_effort is never a stored feature — strip any stale value.
+    // It is a per-request parameter validated against model capabilities in sendToZAI.
     delete(result, "reasoning_effort")
 
+    // enable_thinking defaults to true unless explicitly overridden
     if _, ok := result["enable_thinking"]; !ok {
         result["enable_thinking"] = true
     }
 
+    // Remove 'think' entirely — only enable_thinking reaches the request
     delete(result, "think")
+
+    // ALWAYS exclude image_generation
     result["image_generation"] = false
 
     return result
@@ -366,6 +420,7 @@ func resolveFeaturesWithState(caps map[string]interface{}, state *ModelFeatureSt
 // ============================================================================
 
 func init() {
+    // Initialise URL safe-character table for custom URL encoder
     for i := 0; i < 256; i++ {
         c := byte(i)
         if (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
@@ -376,7 +431,7 @@ func init() {
 }
 
 // ============================================================================
-// LOGGING
+// LOGGING — silent unless --verbose
 // ============================================================================
 
 func logError(msg string) {
@@ -400,7 +455,7 @@ func logInfo(msg string) {
 }
 
 // ============================================================================
-// BUFFER POOLS
+// BUFFER POOLS — eliminate GC pressure on hot paths
 // ============================================================================
 
 var bufPool = sync.Pool{
@@ -415,9 +470,10 @@ var zlibWriterPool = sync.Pool{
 }
 
 // ============================================================================
-// HTTP CLIENTS
+// HTTP CLIENTS — pooled connections, HTTP/2, keep-alive
 // ============================================================================
 
+// Optimised client for Aliyun captcha API calls
 var aliyunHTTPClient = &http.Client{
     Transport: &http.Transport{
         MaxIdleConns:          100,
@@ -432,6 +488,7 @@ var aliyunHTTPClient = &http.Client{
     Timeout: 30 * time.Second,
 }
 
+// Optimised client for Z.AI API calls (no global timeout — streaming)
 var zaiHTTPClient = &http.Client{
     Transport: &http.Transport{
         MaxIdleConns:          100,
@@ -462,6 +519,8 @@ func generateID() string {
     return hex.EncodeToString(b)
 }
 
+// ---------- UUID v4 — manual hex encoding, no fmt.Sprintf ----------
+
 func generateUUID() string {
     var b [16]byte
     rand.Read(b[:])
@@ -482,6 +541,8 @@ func generateUUID() string {
     return string(dst[:])
 }
 
+// ---------- Timestamp helpers ----------
+
 func getTimestampUTC() string {
     return time.Now().UTC().Format("2006-01-02T15:04:05Z")
 }
@@ -490,12 +551,16 @@ func currentTimeMillis() int64 {
     return time.Now().UnixMilli()
 }
 
+// ---------- Token estimation ----------
+
 func estimateTokens(text string) int {
     if text == "" {
         return 0
     }
     return (len(text) + 3) / 4
 }
+
+// ---------- Message helpers ----------
 
 func getMessageContent(content json.RawMessage) string {
     if len(content) == 0 {
@@ -539,7 +604,7 @@ func messagesToPrompt(messages []Message) string {
 func boolPtr(b bool) *bool { return &b }
 
 // ============================================================================
-// URL ENCODING
+// URL ENCODING — custom lookup table, zero allocations for safe chars
 // ============================================================================
 
 const hexUpper = "0123456789ABCDEF"
@@ -619,7 +684,7 @@ func base64Decode(s string) ([]byte, error) {
 }
 
 // ============================================================================
-// JSON MARSHALING
+// JSON MARSHALING — disables HTML escaping, uses pooled buffer
 // ============================================================================
 
 func jsonMarshal(v interface{}) ([]byte, error) {
@@ -639,7 +704,7 @@ func jsonMarshal(v interface{}) ([]byte, error) {
 }
 
 // ============================================================================
-// DATABASE
+// DATABASE — SQLite, pure-Go driver (no CGO)
 // ============================================================================
 
 func initDB() error {
@@ -733,7 +798,7 @@ func buildQueryString(params map[string]string) string {
 }
 
 // ============================================================================
-// HTTP POST
+// HTTP POST — pooled buffer for response, connection reuse
 // ============================================================================
 
 func httpPost(targetURL, body string, extraHeaders map[string]string) (string, error) {
@@ -765,7 +830,7 @@ func httpPost(targetURL, body string, extraHeaders map[string]string) (string, e
 }
 
 // ============================================================================
-// CAPTCHA GENERATION
+// CAPTCHA GENERATION — PART 1: InitCaptchaV3
 // ============================================================================
 
 func initCaptcha() (string, error) {
@@ -799,6 +864,10 @@ func initCaptcha() (string, error) {
     return result.CertifyID, nil
 }
 
+// ============================================================================
+// CAPTCHA GENERATION — PART 2: Generate arg (RC4-like stream cipher)
+// ============================================================================
+
 var argPermTable = [64]int{
     32, 50, 10, 51, 6, 44, 37, 16, 46, 11, 62, 19, 43, 25, 23, 30,
     60, 33, 53, 34, 7, 26, 12, 48, 5, 2, 20, 4, 61, 13, 47, 49,
@@ -811,6 +880,7 @@ const argConstant = "4xrihv8zb8tf1mfj"
 func generateArg(certifyID string) string {
     encoded := urlEncode(certifyID, "")
 
+    // URL-decode (identity for already-decoded strings, kept for faithfulness)
     o := make([]byte, 0, len(encoded))
     for i := 0; i < len(encoded); {
         if encoded[i] == '%' && i+2 < len(encoded) {
@@ -822,6 +892,7 @@ func generateArg(certifyID string) string {
         }
     }
 
+    // KSA
     r := argPermTable
     n := argConstant
     rlen := 64
@@ -835,6 +906,7 @@ func generateArg(certifyID string) string {
         i++
     }
 
+    // PRGA
     t := make([]byte, 0, len(o))
     e, a := 0, 0
     for idx := 0; idx < len(o); idx++ {
@@ -852,6 +924,10 @@ func generateArg(certifyID string) string {
     }
     return base64Encode(t)
 }
+
+// ============================================================================
+// CAPTCHA GENERATION — PART 4: ali_hash (custom hash with 16-byte state)
+// ============================================================================
 
 func aliHash(inputStr, saltStr string) string {
     o := inputStr
@@ -901,6 +977,10 @@ func aliHash(inputStr, saltStr string) string {
     return string(result[:])
 }
 
+// ============================================================================
+// CAPTCHA GENERATION — PART 7: encrypt (same RC4-like cipher, different key)
+// ============================================================================
+
 const encryptKey = "3e627e1b4c63f913"
 
 func encrypt(plaintext []byte) string {
@@ -936,6 +1016,10 @@ func encrypt(plaintext []byte) string {
     return base64Encode(t)
 }
 
+// ============================================================================
+// ZLIB COMPRESS — pooled writer, pooled output buffer
+// ============================================================================
+
 func zlibCompress(data []byte) []byte {
     buf := bufPool.Get().(*bytes.Buffer)
     buf.Reset()
@@ -952,6 +1036,10 @@ func zlibCompress(data []byte) []byte {
     bufPool.Put(buf)
     return result
 }
+
+// ============================================================================
+// CAPTCHA GENERATION — PART 8: VerifyCaptchaV3
+// ============================================================================
 
 func verifyCaptcha(certifyID, dataValue, deviceToken string) (string, error) {
     cvpJSON, err := jsonMarshal(CVP{
@@ -1016,6 +1104,10 @@ func verifyCaptcha(certifyID, dataValue, deviceToken string) (string, error) {
     return "", nil
 }
 
+// ============================================================================
+// COMPUTE FINAL PAYLOAD — tries tokens until success or exhausted
+// ============================================================================
+
 func computeFinalPayload() string {
     for attempt := 0; attempt < maxTokenRetries; attempt++ {
         deviceToken, ok := getNextToken()
@@ -1072,6 +1164,7 @@ func tryCompute(deviceToken string) (string, error) {
     fb64 := base64Encode(compressed)
     finalVal := encrypt([]byte(fb64))
 
+    // Always remove token after use — prevents conflicts
     removeToken(deviceToken)
 
     payload, err := verifyCaptcha(certifyID, finalVal, deviceToken)
@@ -1082,7 +1175,7 @@ func tryCompute(deviceToken string) (string, error) {
 }
 
 // ============================================================================
-// CAPTCHA CACHE
+// CAPTCHA CACHE — Background async generation for speed
 // ============================================================================
 
 type cachedCaptcha struct {
@@ -1116,6 +1209,7 @@ func (c *CaptchaCache) Get() (string, bool) {
     c.mu.Lock()
     defer c.mu.Unlock()
 
+    // Sweep expired (75s TTL)
     var valid []cachedCaptcha
     for _, p := range c.params {
         if time.Since(p.generatedAt) < 75*time.Second {
@@ -1133,6 +1227,7 @@ func (c *CaptchaCache) Get() (string, bool) {
 }
 
 func (c *CaptchaCache) Run() {
+    // Wait a moment before starting to allow session to init
     time.Sleep(2 * time.Second)
     ticker := time.NewTicker(500 * time.Millisecond)
     defer ticker.Stop()
@@ -1140,6 +1235,7 @@ func (c *CaptchaCache) Run() {
     for range ticker.C {
         c.mu.Lock()
         
+        // If no activity in the last 3 minutes, pause generation to save tokens
         if time.Since(c.lastActive) > 3*time.Minute {
             c.active = false
             c.mu.Unlock()
@@ -1147,6 +1243,7 @@ func (c *CaptchaCache) Run() {
         }
         c.active = true
 
+        // Sweep expired
         var valid []cachedCaptcha
         for _, p := range c.params {
             if time.Since(p.generatedAt) < 75*time.Second {
@@ -1159,6 +1256,7 @@ func (c *CaptchaCache) Run() {
         if needed > 0 {
             c.generating += needed
             c.mu.Unlock()
+            // Launch generation in parallel
             for i := 0; i < needed; i++ {
                 go c.generate()
             }
@@ -1185,6 +1283,10 @@ func (c *CaptchaCache) generate() {
     }
     c.mu.Unlock()
 }
+
+// ============================================================================
+// CAPTCHA VERIFICATION PARAM — IN-MEMORY (no FIFO / named pipe)
+// ============================================================================
 
 func getCaptchaVerifyParam() (string, error) {
     if config.AgentMode {
@@ -1306,7 +1408,7 @@ func decodeJWT(token string) (id, name string) {
         return "", ""
     }
     id, _ = data["id"].(string)
-    email, _ = data["email"].(string)
+    email, _ := data["email"].(string)
     name = "Guest"
     if email != "" {
         name = strings.Split(email, "@")[0]
@@ -1395,6 +1497,7 @@ func initializeSession() error {
         "Content-Type": "application/json",
     }
 
+    // Initial guest POST (fire-and-forget)
     ctx1, cancel1 := context.WithTimeout(context.Background(), 15*time.Second)
     defer cancel1()
     req1, _ := http.NewRequestWithContext(ctx1, "POST", BASE_URL+"/api/v1/auths/guest", strings.NewReader("{}"))
@@ -1403,6 +1506,7 @@ func initializeSession() error {
     }
     zaiHTTPClient.Do(req1)
 
+    // GET /api/v1/auths/
     ctx2, cancel2 := context.WithTimeout(context.Background(), 15*time.Second)
     defer cancel2()
     req2, _ := http.NewRequestWithContext(ctx2, "GET", BASE_URL+"/api/v1/auths/", nil)
@@ -1486,8 +1590,11 @@ func sendToZAI(prompt string, opts SendOptions) (<-chan ZAIResult, error) {
         model = "glm-5"
     }
 
+    // Resolve features dynamically from per-model state
+    // (server defaults + stored user overrides)
     featuresMap := resolveFeaturesForModel(model)
 
+    // Apply per-request overrides (highest precedence)
     if opts.WebSearch != nil {
         if *opts.WebSearch {
             featuresMap["auto_web_search"] = true
@@ -1507,12 +1614,18 @@ func sendToZAI(prompt string, opts SendOptions) (<-chan ZAIResult, error) {
         featuresMap["preview_mode"] = *opts.PreviewMode
     }
 
+    // ── reasoning_effort handling ──
+    // Defensive: always strip any stale reasoning_effort first so unsupported
+    // models never receive a placeholder value (would cause malfunction).
     delete(featuresMap, "reasoning_effort")
 
     if opts.ReasoningEffort != "" {
         if modelSupportsReasoningEffort(model) {
             if isValidReasoningEffort(opts.ReasoningEffort) {
+                // Forward reasoning_effort INSIDE the features payload
                 featuresMap["reasoning_effort"] = opts.ReasoningEffort
+                // When reasoning_effort is active, enable_thinking MUST be true
+                // and any user modification on enable_thinking is ignored.
                 featuresMap["enable_thinking"] = true
                 logInfo(fmt.Sprintf(
                     "[reasoning_effort] model=%s effort=%s enabled (enable_thinking forced true)",
@@ -1529,6 +1642,7 @@ func sendToZAI(prompt string, opts SendOptions) (<-chan ZAIResult, error) {
         }
     }
 
+    // Remove 'think' entirely; ALWAYS force image_generation to false
     delete(featuresMap, "think")
     featuresMap["image_generation"] = false
 
@@ -1604,12 +1718,18 @@ func sendToZAIStream(prompt string, opts struct {
             return err
         }
 
+        // Build features payload from dynamically resolved per-model features.
+        // reasoning_effort is only present in opts.FeaturesMap if the model supports
+        // it AND a valid value was provided — no placeholder is added for
+        // unsupported models (would cause malfunction).
         featuresPayload := make(map[string]interface{})
         for k, v := range opts.FeaturesMap {
             featuresPayload[k] = v
         }
+        // Remove 'think' entirely — only enable_thinking reaches the request
         delete(featuresPayload, "think")
         featuresPayload["flags"] = []interface{}{}
+        // image_generation is ALWAYS false
         featuresPayload["image_generation"] = false
 
         requestBody := map[string]interface{}{
@@ -1698,8 +1818,12 @@ func sendToZAIStream(prompt string, opts struct {
     return errors.New("Max retries exceeded")
 }
 
+// extractZAIError inspects a parsed Z.AI SSE payload for an embedded error
+// (Z.AI sometimes returns HTTP 200 with the error inside the JSON body).
+// Returns the human-readable detail string, or "" if no error is present.
 func extractZAIError(j map[string]interface{}) string {
     if data, ok := j["data"].(map[string]interface{}); ok {
+        // data.error
         if errObj, ok := data["error"].(map[string]interface{}); ok {
             detail, _ := errObj["detail"].(string)
             if detail == "" {
@@ -1714,6 +1838,7 @@ func extractZAIError(j map[string]interface{}) string {
                 return detail
             }
         }
+        // data.data.error (nested variant observed in production)
         if nested, ok := data["data"].(map[string]interface{}); ok {
             if errObj, ok := nested["error"].(map[string]interface{}); ok {
                 detail, _ := errObj["detail"].(string)
@@ -1731,6 +1856,7 @@ func extractZAIError(j map[string]interface{}) string {
             }
         }
     }
+    // Top-level error (non-Z.AI shape, just in case)
     if errObj, ok := j["error"].(map[string]interface{}); ok {
         detail, _ := errObj["detail"].(string)
         if detail == "" {
@@ -1745,6 +1871,7 @@ func extractZAIError(j map[string]interface{}) string {
     return ""
 }
 
+// statusFromError maps a Z.AI/bridge error string to an HTTP status code.
 func statusFromError(errMsg string) int {
     switch {
     case strings.Contains(errMsg, "401"):
@@ -1781,14 +1908,18 @@ func safeUTF8Delta(fullContent string, sentLen int) (delta string, newSentLen in
     return fullContent[start:end], end
 }
 
+
 func streamSSEResponse(body io.Reader, ch chan<- ZAIResult) error {
     scanner := bufio.NewScanner(body)
     scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
 
+    // ── Accumulated state across SSE lines ──
     var fullText strings.Builder
     sentLen := 0
     sentReasoning := 0
 
+    // stripDetailsTags removes <details ...> and </details> wrappers
+    // and leading "> " markdown-quote prefixes from each line.
     stripDetailsTags := func(s string) string {
         if idx := strings.Index(s, "<details"); idx >= 0 {
             if end := strings.Index(s[idx:], ">"); end >= 0 {
@@ -1806,6 +1937,7 @@ func streamSSEResponse(body io.Reader, ch chan<- ZAIResult) error {
     flush := func() {
         raw := fullText.String()
 
+        // Split <details ...> ... </details> into reasoning vs content
         var reasoning, content string
         if idx := strings.Index(raw, "<details"); idx >= 0 {
             if tagEnd := strings.Index(raw[idx:], ">"); tagEnd >= 0 {
@@ -1814,11 +1946,12 @@ func streamSSEResponse(body io.Reader, ch chan<- ZAIResult) error {
                     reasoning = afterTag[:closeIdx]
                     content = raw[:idx] + afterTag[closeIdx+len("</details>"):]
                 } else {
+                    // <details> opened but not yet closed
                     reasoning = afterTag
                     content = raw[:idx]
                 }
             } else {
-                content = raw
+                content = raw // tag not complete yet
             }
         } else {
             content = raw
@@ -1828,6 +1961,7 @@ func streamSSEResponse(body io.Reader, ch chan<- ZAIResult) error {
             reasoning = stripDetailsTags(reasoning)
         }
 
+        // Emit content delta
         if len(content) > sentLen {
             cDelta, cNewLen := safeUTF8Delta(content, sentLen)
             ch <- ZAIResult{Chunk: cDelta, FullText: content}
@@ -1836,6 +1970,7 @@ func streamSSEResponse(body io.Reader, ch chan<- ZAIResult) error {
             sentLen = len(content)
         }
 
+        // Emit reasoning delta
         if len(reasoning) > sentReasoning {
             rDelta, rNewLen := safeUTF8Delta(reasoning, sentReasoning)
             ch <- ZAIResult{Reasoning: rDelta}
@@ -1870,6 +2005,7 @@ func streamSSEResponse(body io.Reader, ch chan<- ZAIResult) error {
             continue
         }
 
+        // ── Detect inline errors (HTTP 200 with error in body) ──
         if errDetail := extractZAIError(j); errDetail != "" {
             if config.Logging.Level == "debug" {
                 log.Println("[DEBUG] Z.AI inline SSE error:", errDetail)
@@ -1884,14 +2020,17 @@ func streamSSEResponse(body io.Reader, ch chan<- ZAIResult) error {
             }
         }
 
+        // ── Content accumulation ──
         if data, ok := j["data"].(map[string]interface{}); ok {
             if ec, ok := data["edit_content"].(string); ok && ec != "" {
+                // edit_content = FULL replacement starting at edit_index
                 editIndex := -1
                 if ei, ok := data["edit_index"].(float64); ok {
                     editIndex = int(ei)
                 }
                 current := fullText.String()
                 if editIndex >= 0 {
+                    // Convert rune-based edit_index to byte offset
                     byteIdx := 0
                     runeCount := 0
                     for byteIdx < len(current) {
@@ -1907,6 +2046,7 @@ func streamSSEResponse(body io.Reader, ch chan<- ZAIResult) error {
                     if editIndex <= len(current) {
                         current = current[:editIndex] + ec
                     } else {
+                        // Z.AI index beyond current length — pad
                         for len(current) < editIndex {
                             current += " "
                         }
@@ -2017,9 +2157,18 @@ func formatOpenAIError(message, errType string, code interface{}) interface{} {
 }
 
 // ============================================================================
-// ANTHROPIC /v1/messages PROTOCOL SUPPORT
+// ANTHROPIC /v1/messages PROTOCOL SUPPORT  [ANTHROPIC_PROTOCOL_PATCHED]
 // ============================================================================
+//
+// Exposes the Anthropic Messages API at /v1/messages. Feeds directly on the
+// ZAIResult stream produced by sendToZAI — the same stream powering the
+// OpenAI handler — and converts each chunk to Anthropic SSE events on the
+// fly with zero intermediate allocations beyond the event JSON itself.
+//
+// Auth: Anthropic clients send the API key via x-api-key header (handled in
+// checkAuth). The anthropic-version header is allowed via CORS.
 
+// formatAnthropicError builds an Anthropic-style error envelope.
 func formatAnthropicError(errType, message string) interface{} {
     return map[string]interface{}{
         "type": "error",
@@ -2030,6 +2179,8 @@ func formatAnthropicError(errType, message string) interface{} {
     }
 }
 
+// extractAnthropicContent coerces an Anthropic content field (string or
+// array of content blocks) into a plain string.
 func extractAnthropicContent(content interface{}) string {
     if content == nil {
         return ""
@@ -2054,6 +2205,9 @@ func extractAnthropicContent(content interface{}) string {
     return string(b)
 }
 
+// anthropicToOpenAIRequest converts an Anthropic /v1/messages request body
+// to an OpenAI /v1/chat/completions request body for the existing sendToZAI
+// pipeline.
 func anthropicToOpenAIRequest(bodyBytes []byte) ([]byte, error) {
     var req map[string]interface{}
     if err := json.Unmarshal(bodyBytes, &req); err != nil {
@@ -2080,8 +2234,9 @@ func anthropicToOpenAIRequest(bodyBytes []byte) ([]byte, error) {
         out["stop"] = ss
     }
 
-    var messages []map[string]interface{}{}
+    var messages []map[string]interface{}
 
+    // System field -> system message
     if sys, ok := req["system"]; ok {
         sysStr := extractAnthropicContent(sys)
         if sysStr != "" {
@@ -2092,6 +2247,7 @@ func anthropicToOpenAIRequest(bodyBytes []byte) ([]byte, error) {
         }
     }
 
+    // Convert messages
     if msgs, ok := req["messages"].([]interface{}); ok {
         for _, m := range msgs {
             mm, ok := m.(map[string]interface{})
@@ -2101,6 +2257,7 @@ func anthropicToOpenAIRequest(bodyBytes []byte) ([]byte, error) {
             role, _ := mm["role"].(string)
             content := mm["content"]
 
+            // Handle tool_result content blocks in user messages
             if arr, ok := content.([]interface{}); ok {
                 hasToolResult := false
                 for _, item := range arr {
@@ -2122,6 +2279,7 @@ func anthropicToOpenAIRequest(bodyBytes []byte) ([]byte, error) {
                 }
             }
 
+            // Handle assistant tool_use blocks -> OpenAI tool_calls
             if role == "assistant" {
                 if arr, ok := content.([]interface{}); ok {
                     var textParts []string
@@ -2172,6 +2330,7 @@ func anthropicToOpenAIRequest(bodyBytes []byte) ([]byte, error) {
     }
     out["messages"] = messages
 
+    // Convert tools: input_schema -> parameters, wrap in function
     if tools, ok := req["tools"].([]interface{}); ok && len(tools) > 0 {
         var openaiTools []map[string]interface{}
         for _, t := range tools {
@@ -2196,6 +2355,7 @@ func anthropicToOpenAIRequest(bodyBytes []byte) ([]byte, error) {
         out["tools"] = openaiTools
     }
 
+    // Convert thinking config
     if thinking, ok := req["thinking"].(map[string]interface{}); ok {
         out["thinking"] = thinking
         if t, _ := thinking["type"].(string); t == "enabled" {
@@ -2206,6 +2366,7 @@ func anthropicToOpenAIRequest(bodyBytes []byte) ([]byte, error) {
     return json.Marshal(out)
 }
 
+// thinkingEnabled returns true if the Anthropic thinking config is enabled.
 func thinkingEnabled(thinkingCfg json.RawMessage) bool {
     if len(thinkingCfg) == 0 {
         return false
@@ -2219,6 +2380,7 @@ func thinkingEnabled(thinkingCfg json.RawMessage) bool {
     return tc.Type == "enabled"
 }
 
+// anthropicMessagesHandler exposes the Anthropic Messages API at /v1/messages.
 func anthropicMessagesHandler(w http.ResponseWriter, r *http.Request) {
     if r.Method != "POST" {
         writeJSON(w, 405, formatAnthropicError("invalid_request_error", "Method not allowed"))
@@ -2310,6 +2472,7 @@ func anthropicMessagesHandler(w http.ResponseWriter, r *http.Request) {
     }
 }
 
+// anthropicStreamResponse converts a ZAIResult stream to Anthropic SSE events.
 func anthropicStreamResponse(w http.ResponseWriter, prompt string, opts SendOptions, model, requestId string) {
     w.Header().Set("Content-Type", "text/event-stream")
     w.Header().Set("Cache-Control", "no-cache")
@@ -2331,6 +2494,7 @@ func anthropicStreamResponse(w http.ResponseWriter, prompt string, opts SendOpti
 
     inputTokens := estimateTokens(prompt)
 
+    // message_start
     writeEvent("message_start", map[string]interface{}{
         "type": "message_start",
         "message": map[string]interface{}{
@@ -2350,6 +2514,7 @@ func anthropicStreamResponse(w http.ResponseWriter, prompt string, opts SendOpti
 
     writeEvent("ping", map[string]interface{}{"type": "ping"})
 
+    // Keep-alive pings
     keepAliveStop := make(chan struct{})
     var wg sync.WaitGroup
     wg.Add(1)
@@ -2384,6 +2549,7 @@ func anthropicStreamResponse(w http.ResponseWriter, prompt string, opts SendOpti
             "content_block": cb,
         })
     }
+
 
     stopBlock := func() {
         if currentBlockType != "" {
@@ -2423,6 +2589,7 @@ func anthropicStreamResponse(w http.ResponseWriter, prompt string, opts SendOpti
             return
         }
 
+        // Reasoning -> thinking content block
         if result.Reasoning != "" {
             if currentBlockType != "thinking" {
                 stopBlock()
@@ -2440,6 +2607,7 @@ func anthropicStreamResponse(w http.ResponseWriter, prompt string, opts SendOpti
             continue
         }
 
+        // Content delta
         if result.FullText != "" {
             fullContent = result.FullText
         } else {
@@ -2453,6 +2621,9 @@ func anthropicStreamResponse(w http.ResponseWriter, prompt string, opts SendOpti
             }
         }
 
+        if len(fullContent) <= len(sentContent) {
+            continue
+        }
         delta, newLen := safeUTF8Delta(fullContent, len(sentContent))
         if delta == "" {
             continue
@@ -2480,6 +2651,7 @@ func anthropicStreamResponse(w http.ResponseWriter, prompt string, opts SendOpti
                 fn, _ := tc["function"].(map[string]interface{})
                 argsStr, _ := fn["arguments"].(string)
                 if id, ok := tc["id"].(string); ok && id != "" {
+                    // Header delta — start new tool_use block
                     stopBlock()
                     name, _ := fn["name"].(string)
                     tooluID := "toolu_" + strings.TrimPrefix(id, "call_")
@@ -2500,6 +2672,7 @@ func anthropicStreamResponse(w http.ResponseWriter, prompt string, opts SendOpti
                         })
                     }
                 } else {
+                    // Arguments delta — emit partial JSON
                     if argsStr != "" {
                         writeEvent("content_block_delta", map[string]interface{}{
                             "type":  "content_block_delta",
@@ -2529,6 +2702,7 @@ func anthropicStreamResponse(w http.ResponseWriter, prompt string, opts SendOpti
         }
     }
 
+    // Flush interceptor trailing text
     if interceptor != nil {
         if rem := interceptor.flushFinal(); rem != "" && !toolCallEmitted {
             if currentBlockType != "text" {
@@ -2552,6 +2726,7 @@ func anthropicStreamResponse(w http.ResponseWriter, prompt string, opts SendOpti
                 fn, _ := tc["function"].(map[string]interface{})
                 argsStr, _ := fn["arguments"].(string)
                 if id, ok := tc["id"].(string); ok && id != "" {
+                    // Header delta — start new tool_use block
                     stopBlock()
                     name, _ := fn["name"].(string)
                     tooluID := "toolu_" + strings.TrimPrefix(id, "call_")
@@ -2572,6 +2747,7 @@ func anthropicStreamResponse(w http.ResponseWriter, prompt string, opts SendOpti
                         })
                     }
                 } else {
+                    // Arguments delta — emit partial JSON
                     if argsStr != "" {
                         writeEvent("content_block_delta", map[string]interface{}{
                             "type":  "content_block_delta",
@@ -2611,6 +2787,7 @@ func anthropicStreamResponse(w http.ResponseWriter, prompt string, opts SendOpti
     writeEvent("message_stop", map[string]interface{}{"type": "message_stop"})
 }
 
+// anthropicNonStreamResponse produces a single Anthropic message object.
 func anthropicNonStreamResponse(w http.ResponseWriter, prompt string, opts SendOptions, model, requestId string) {
     ch, err := sendToZAI(prompt, opts)
     if err != nil {
@@ -2740,6 +2917,7 @@ func checkAuth(r *http.Request) bool {
     if len(authHeader) >= 7 && strings.EqualFold(authHeader[:7], "Bearer ") {
         provided = authHeader[7:]
     }
+    // Anthropic clients send the API key via x-api-key header
     if provided == "" {
         provided = r.Header.Get("x-api-key")
     }
@@ -2803,6 +2981,8 @@ func statusHandler(w http.ResponseWriter, r *http.Request) {
     })
 }
 
+// fetchModelsFromZAI retrieves models from Z.AI /api/models,
+// keeping only glm-4.7 and newer (the API returns newest-first).
 func fetchModelsFromZAI() []ModelInfo {
     modelsCacheMu.Lock()
     defer modelsCacheMu.Unlock()
@@ -2882,6 +3062,7 @@ func fetchModelsFromZAI() []ModelInfo {
             Description:  m.Info.Meta.Description,
             Capabilities: m.Info.Meta.Capabilities,
         })
+        // glm-4.7 is the cutoff — stop here (inclusive)
         if m.ID == "glm-4.7" {
             break
         }
@@ -2899,8 +3080,10 @@ func fetchModelsFromZAI() []ModelInfo {
     return fallbackModels
 }
 
+// getFeaturesForModel maps a model's capabilities to a Features struct.
+// enable_thinking defaults to true; web_search/auto_web_search default to false.
 func getFeaturesForModel(modelID string) Features {
-    f := Features{Thinking: true}
+    f := Features{Thinking: true} // enable_thinking enabled by default
     for _, m := range fetchModelsFromZAI() {
         if strings.EqualFold(m.ID, modelID) {
             if v, ok := m.Capabilities["enable_thinking"].(bool); ok {
@@ -2915,6 +3098,7 @@ func getFeaturesForModel(modelID string) Features {
     return f
 }
 
+// getModelCapabilities returns the raw capabilities map for a model.
 func getModelCapabilities(modelID string) map[string]interface{} {
     for _, m := range fetchModelsFromZAI() {
         if strings.EqualFold(m.ID, modelID) {
@@ -2924,6 +3108,9 @@ func getModelCapabilities(modelID string) map[string]interface{} {
     return nil
 }
 
+// modelSupportsReasoningEffort returns true only when the model's capabilities
+// JSON explicitly contains "reasoning_effort": true.
+// Models with "reasoning_effort": false or without the field are NOT supported.
 func modelSupportsReasoningEffort(modelID string) bool {
     if modelID == "" {
         return false
@@ -2936,6 +3123,8 @@ func modelSupportsReasoningEffort(modelID string) bool {
     return ok && v
 }
 
+// isValidReasoningEffort validates the accepted reasoning_effort values.
+// Accepted: "high", "max". Any other value is rejected.
 func isValidReasoningEffort(value string) bool {
     switch value {
     case "high", "max":
@@ -2982,8 +3171,34 @@ func modelsHandler2(w http.ResponseWriter, r *http.Request) {
 }
 
 // ============================================================================
-// AGENT MODE
+// AGENT MODE — Tools & Role Translation for Z.AI Compatibility
 // ============================================================================
+//
+// Z.AI's unofficial /api/v2/chat/completions endpoint only accepts messages
+// with role="user". System, assistant, and tool roles cause INTERNAL_ERROR.
+// OpenAI-style tools/function_calls are also rejected.
+//
+// Agent mode performs three transformations when config.AgentMode == true:
+//
+//   1. Mandatory System Prefix: A user message is prepended explaining the
+//      prompt architecture (roles, tools) so the model can interpret the
+//      rewritten conversation correctly.
+//
+//   2. Role Replacement: Every non-user message is rewritten as a user
+//      message with a [ROLE: <original_role>] tag prepended to its content.
+//      e.g. system message "Do X" becomes user message "[ROLE: system] Do X".
+//
+//   3. Tool Translation & Simulation: OpenAI tools JSON is rendered into a
+//      user message with a strict contract: the model MUST emit any tool
+//      invocation as a fenced JSON block of the form
+//
+//          <<<TOOL_CALL>>>
+//          {"name":"<tool_name>","arguments":{...}}
+//          <<<END_TOOL_CALL>>>
+//
+//      The SSE streamer intercepts this token sequence in the assistant
+//      output, parses the JSON, and rewrites the chunk into an OpenAI-style
+//      tool_calls delta with finish_reason="tool_calls".
 
 const agentSystemPrefix = `[SYSTEM]
 You are operating in AGENT MODE through a compatibility shim. The downstream
@@ -3111,6 +3326,8 @@ End of tool contract.`
 const agentToolCallStart = "<<<TOOL_CALL>>>"
 const agentToolCallEnd   = "<<<END_TOOL_CALL>>>"
 
+// renderToolsContract formats an OpenAI-style tools array into the
+// contract body text.
 func renderToolsContract(tools []interface{}) string {
     var sb strings.Builder
     for i, t := range tools {
@@ -3143,6 +3360,8 @@ func renderToolsContract(tools []interface{}) string {
     return sb.String()
 }
 
+// extractContentString coerces an OpenAI message content field (string or
+// array of content parts) into a single string.
 func extractContentString(c interface{}) string {
     if c == nil {
         return ""
@@ -3170,6 +3389,11 @@ func extractContentString(c interface{}) string {
     return string(b)
 }
 
+// transformMessagesForAgent rewrites an OpenAI messages array for Z.AI:
+//   - prepends the system prefix as a user message
+//   - rewrites every non-user role as user with a [ROLE: x] prefix
+//   - if tools are provided, appends a tool contract user message
+// Returns the new JSON-encoded messages array.
 func transformMessagesForAgent(rawMessages json.RawMessage, tools []interface{}) ([]byte, error) {
     var msgs []map[string]interface{}
     if err := json.Unmarshal(rawMessages, &msgs); err != nil {
@@ -3178,11 +3402,13 @@ func transformMessagesForAgent(rawMessages json.RawMessage, tools []interface{})
 
     out := make([]map[string]interface{}, 0, len(msgs)+2)
 
+    // 1. Mandatory system prefix
     out = append(out, map[string]interface{}{
         "role":    "user",
         "content": agentSystemPrefix,
     })
 
+    // 2. Role replacement
     for _, m := range msgs {
         role, _ := m["role"].(string)
         if role == "" {
@@ -3205,6 +3431,7 @@ func transformMessagesForAgent(rawMessages json.RawMessage, tools []interface{})
         })
     }
 
+    // 3. Tool contract
     if len(tools) > 0 {
         out = append(out, map[string]interface{}{
             "role":    "user",
@@ -3215,29 +3442,34 @@ func transformMessagesForAgent(rawMessages json.RawMessage, tools []interface{})
     return json.Marshal(out)
 }
 
+// agentStreamInterceptor rewrites assistant output containing
+// <<<TOOL_CALL>>>{...}<<<END_TOOL_CALL>>> blocks into OpenAI-style
+// tool_calls deltas. Non-tool-call text is passed through verbatim.
 type agentStreamInterceptor struct {
     buf       strings.Builder
-    flushed   int
-    emitting  bool
+    flushed   int  // offset into buf that has been processed
+    emitting  bool // currently inside a tool-call block
     callIndex int
 
+    // Streaming tool-call state (incremental args streaming)
     tcNameFound    bool
     tcName         string
     tcId           string
-    tcArgsFound    bool
-    tcArgsPos      int
-    tcArgsStreamed int
-    tcBraceDepth   int
-    tcInString     bool
-    tcEscapeNext   bool
-    tcArgsDone     bool
-    tcFallback     bool
+    tcArgsFound    bool // found "arguments": and value start
+    tcArgsPos      int  // absolute byte offset in buf where args value starts
+    tcArgsStreamed int  // bytes of args value already streamed
+    tcBraceDepth   int  // brace depth for tracking args object end
+    tcInString     bool // inside a string in args
+    tcEscapeNext   bool // next char is escaped in args
+    tcArgsDone     bool // args object fully streamed
+    tcFallback     bool // fallback to buffered mode
 }
 
 func newAgentStreamInterceptor() *agentStreamInterceptor {
     return &agentStreamInterceptor{callIndex: -1}
 }
 
+// resetToolCallState clears streaming tool-call state for the next call.
 func (a *agentStreamInterceptor) resetToolCallState() {
     a.tcNameFound = false
     a.tcName = ""
@@ -3252,6 +3484,9 @@ func (a *agentStreamInterceptor) resetToolCallState() {
     a.tcFallback = false
 }
 
+// tryExtractName extracts the "name" field value from partial JSON.
+// Returns the name and byte offset after closing quote, or "" and -1.
+// Only searches before "arguments" key to avoid matching nested keys.
 func tryExtractName(text string) (string, int) {
     searchEnd := len(text)
     if argsIdx := strings.Index(text, `"arguments"`); argsIdx >= 0 {
@@ -3286,6 +3521,9 @@ func tryExtractName(text string) (string, int) {
     return "", -1
 }
 
+// findArgsStart finds the start position of the "arguments" value in partial JSON.
+// Only returns a position if the value starts with '{' (object arguments).
+// Returns -1 if not found or not enough data yet.
 func findArgsStart(text string) int {
     keyIdx := strings.Index(text, `"arguments"`)
     if keyIdx < 0 {
@@ -3306,11 +3544,15 @@ func findArgsStart(text string) int {
         return -1
     }
     if text[pos] != '{' {
-        return -1
+        return -1 // non-object args -> use fallback
     }
     return pos
 }
 
+// feed accepts a new chunk of assistant text and returns:
+//   - contentDelta: text to emit as a content delta (may be "")
+//   - toolCalls: parsed tool call deltas to emit (may be nil)
+//   - finishToolCalls: true if a complete tool call was just emitted
 func (a *agentStreamInterceptor) feed(chunk string) (contentDelta string, toolCalls []map[string]interface{}, finishToolCalls bool) {
     a.buf.WriteString(chunk)
     data := a.buf.String()
@@ -3331,6 +3573,7 @@ func (a *agentStreamInterceptor) feed(chunk string) (contentDelta string, toolCa
 
             jsonText := rawData[:jsonEnd]
 
+            // ── Fallback mode: buffer everything, parse at end ──
             if a.tcFallback {
                 if !complete {
                     return
@@ -3369,6 +3612,9 @@ func (a *agentStreamInterceptor) feed(chunk string) (contentDelta string, toolCa
                 continue
             }
 
+            // ── Streaming mode ──
+
+            // Phase 1: Extract and emit name header
             if !a.tcNameFound {
                 name, _ := tryExtractName(jsonText)
                 if name != "" {
@@ -3390,6 +3636,7 @@ func (a *agentStreamInterceptor) feed(chunk string) (contentDelta string, toolCa
                 }
             }
 
+            // Phase 2: Find arguments value start
             if a.tcNameFound && !a.tcArgsFound && !a.tcArgsDone {
                 argsPos := findArgsStart(jsonText)
                 if argsPos >= 0 {
@@ -3402,11 +3649,13 @@ func (a *agentStreamInterceptor) feed(chunk string) (contentDelta string, toolCa
                 } else if !complete {
                     return
                 } else {
+                    // Complete but no object args found — use fallback
                     a.tcFallback = true
                     continue
                 }
             }
 
+            // Phase 3: Stream arguments bytes incrementally
             if a.tcArgsFound && !a.tcArgsDone {
                 var streamEnd int
                 if complete {
@@ -3469,8 +3718,10 @@ func (a *agentStreamInterceptor) feed(chunk string) (contentDelta string, toolCa
                 }
             }
 
+            // Phase 4: Finalize on completion
             if complete {
                 if !a.tcNameFound {
+                    // Name never extracted — try fallback parse
                     a.tcFallback = true
                     continue
                 }
@@ -3487,8 +3738,11 @@ func (a *agentStreamInterceptor) feed(chunk string) (contentDelta string, toolCa
             return
         }
 
+        // Not emitting — look for start marker
         relIdx := strings.Index(data[a.flushed:], agentToolCallStart)
         if relIdx < 0 {
+            // No start marker. Emit everything except a tail that could
+            // be a partial marker (len-1 chars held back).
             safe := len(data) - a.flushed
             tail := len(agentToolCallStart) - 1
             if safe > tail {
@@ -3498,19 +3752,24 @@ func (a *agentStreamInterceptor) feed(chunk string) (contentDelta string, toolCa
             }
             return
         }
+        // Emit text before the start marker as content
         if relIdx > 0 {
             contentDelta += data[a.flushed : a.flushed+relIdx]
             a.flushed += relIdx
         }
+        // Advance past the start marker
         a.flushed += len(agentToolCallStart)
         a.emitting = true
         a.resetToolCallState()
+        // Skip trailing newline after start marker
         for a.flushed < len(data) && (data[a.flushed] == '\n' || data[a.flushed] == '\r') {
             a.flushed++
         }
     }
 }
 
+// flushFinal emits any remaining buffered content (called at stream end).
+// Returns "" if we were mid-tool-call (incomplete — discarded).
 func (a *agentStreamInterceptor) flushFinal() string {
     if a.emitting {
         return ""
@@ -3524,6 +3783,8 @@ func (a *agentStreamInterceptor) flushFinal() string {
     return rem
 }
 
+// extractAgentToolCalls parses all <<<TOOL_CALL>>>{...}<<<END_TOOL_CALL>>>
+// blocks from text and returns OpenAI-style tool_calls entries.
 func extractAgentToolCalls(text string) []map[string]interface{} {
     var out []map[string]interface{}
     idx := 0
@@ -3565,6 +3826,8 @@ func extractAgentToolCalls(text string) []map[string]interface{} {
     return out
 }
 
+// stripAgentToolCallBlocks removes all tool-call blocks from text and
+// returns the residual content (trimmed).
 func stripAgentToolCallBlocks(text string) string {
     var sb strings.Builder
     idx := 0
@@ -3635,6 +3898,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
     chatID := randomUUID()
     requestId := generateID()
 
+    // ── Agent mode: transform tools & roles for Z.AI compatibility ──
     var transformedMessages json.RawMessage = body.Messages
     if config.AgentMode {
         var agentTools []interface{}
@@ -3643,6 +3907,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
         }
         if tm, err := transformMessagesForAgent(body.Messages, agentTools); err == nil {
             transformedMessages = tm
+            // Re-parse so local `messages` reflects the rewritten content
             var localMsgs []Message
             if err := json.Unmarshal(tm, &localMsgs); err == nil {
                 messages = localMsgs
@@ -3654,6 +3919,8 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 
     prompt := messagesToPrompt(messages)
 
+    // Features are now resolved per-model inside sendToZAI.
+    // Per-request overrides are only set if explicitly provided in the body.
     opts := SendOptions{
         Model:             model,
         ChatID:            chatID,
@@ -3661,6 +3928,9 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
         ReasoningEffort:   body.ReasoningEffort,
     }
 
+    // Parse thinking configuration:
+    //   reasoning: true/false  ->  enable_thinking
+    //   "thinking": {"type":"enabled"|"disabled"}  ->  enable_thinking
     if body.Reasoning != nil {
         opts.Thinking = body.Reasoning
     } else if len(body.Thinking) > 0 {
@@ -3786,6 +4056,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
                     fullContent += result.Chunk
                 }
                 
+                // Detect content shrinkage (e.g., edit_content truncated the text)
                 if len(fullContent) < len(sentContent) {
                     sentContent = ""
                     if interceptor != nil {
@@ -3821,11 +4092,13 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 
         if !errored {
             if interceptor != nil {
+                // Flush any trailing text content
                 if rem := interceptor.flushFinal(); rem != "" && !toolCallEmitted {
                     c := formatOpenAIResponse(ResponseResult{Content: rem}, model, requestId, true)
                     writeSSE(toJSON(c))
                 }
                 
+                // Safety net: fallback tool call extraction at stream end
                 if !toolCallEmitted {
                     fallbackCalls := extractAgentToolCalls(fullContent)
                     if len(fallbackCalls) > 0 {
@@ -3892,6 +4165,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
             }
         }
 
+        // Agent-mode: parse out tool-call blocks for non-stream response
         if config.AgentMode {
             toolCalls := extractAgentToolCalls(fullContent)
             if len(toolCalls) > 0 {
@@ -3932,6 +4206,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
     }
 }
 func featuresHandler(w http.ResponseWriter, r *http.Request) {
+    // ── GET: return resolved features for a model ──
     if r.Method == "GET" {
         model := r.URL.Query().Get("model")
         if model != "" {
@@ -3947,6 +4222,7 @@ func featuresHandler(w http.ResponseWriter, r *http.Request) {
             })
             return
         }
+        // No model specified — return all per-model states
         modelFeatureStatesMu.Lock()
         states := make(map[string]interface{})
         for k, v := range modelFeatureStates {
@@ -3967,12 +4243,15 @@ func featuresHandler(w http.ResponseWriter, r *http.Request) {
         return
     }
 
+    // ── POST: update per-model feature state ──
+
     bodyBytes, err := io.ReadAll(r.Body)
     if err != nil {
         writeJSON(w, 400, map[string]interface{}{"error": "Failed to read body"})
         return
     }
 
+    // Parse as raw map to capture arbitrary capability keys
     var body map[string]interface{}
     if err := json.Unmarshal(bodyBytes, &body); err != nil {
         writeJSON(w, 400, map[string]interface{}{"error": "Invalid JSON"})
@@ -3985,6 +4264,7 @@ func featuresHandler(w http.ResponseWriter, r *http.Request) {
         return
     }
 
+    // Check Include-All-Features header
     includeAllHeader := strings.EqualFold(r.Header.Get("Include-All-Features"), "true")
 
     modelFeatureStatesMu.Lock()
@@ -3997,15 +4277,19 @@ func featuresHandler(w http.ResponseWriter, r *http.Request) {
         modelFeatureStates[model] = state
     }
 
+    // Set IncludeAll flag if header is present
     if includeAllHeader {
         state.IncludeAll = true
     }
 
+    // Process user overrides — any key except "model" is treated as a feature override.
+    // Special handling: reasoning/thinking -> enable_thinking
     for k, v := range body {
         if k == "model" {
             continue
         }
 
+        // reasoning: true/false -> enable_thinking
         if k == "reasoning" {
             if b, ok := v.(bool); ok {
                 state.Overrides["enable_thinking"] = b
@@ -4013,6 +4297,7 @@ func featuresHandler(w http.ResponseWriter, r *http.Request) {
             continue
         }
 
+        // "thinking": {"type":"enabled"|"disabled"} or thinking: true/false -> enable_thinking
         if k == "thinking" {
             if b, ok := v.(bool); ok {
                 state.Overrides["enable_thinking"] = b
@@ -4027,19 +4312,25 @@ func featuresHandler(w http.ResponseWriter, r *http.Request) {
             continue
         }
 
+        // All other keys: convert camelCase to snake_case (no alias mapping)
         snakeKey := normalizeFeatureKey(k)
+        // image_generation overrides are ignored — always forced false
         if snakeKey == "image_generation" {
             continue
         }
+        // 'think' is not accepted — use enable_thinking, reasoning, or thinking
         if snakeKey == "think" {
             continue
         }
+        // reasoning_effort is a per-request parameter validated against model
+        // capabilities; it is NOT stored as a persistent override.
         if snakeKey == "reasoning_effort" {
             continue
         }
         state.Overrides[snakeKey] = v
     }
 
+    // Resolve final features for response
     caps := getModelCapabilities(model)
     resolved := resolveFeaturesWithState(caps, state)
     includeAll := state.IncludeAll
@@ -4049,6 +4340,7 @@ func featuresHandler(w http.ResponseWriter, r *http.Request) {
     }
     modelFeatureStatesMu.Unlock()
 
+    // Update session.Features for backward compat (dashboard display)
     session.mu.Lock()
     if v, ok := resolved["auto_web_search"].(bool); ok {
         session.Features.WebSearch = v
@@ -4164,6 +4456,7 @@ func main() {
         logInfo("Agent mode: Captcha background cache started")
     }
 
+    // HTTP server setup
     mux := http.NewServeMux()
 
     mux.HandleFunc("/", dashboardHandler)
@@ -4204,6 +4497,7 @@ func main() {
         if err := initializeSession(); err != nil {
             log.Println("[Startup] Session init deferred — will retry on first request.")
         }
+        // Warm up model cache
         fetchModelsFromZAI()
     }()
 
