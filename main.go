@@ -2085,17 +2085,7 @@ func streamSSEResponse(body io.Reader, ch chan<- ZAIResult) error {
                 }
                 current := fullText.String()
                 if editIndex >= 0 {
-                    byteIdx := 0
-                    runeCount := 0
-                    for byteIdx < len(current) {
-                        if runeCount == editIndex {
-                            break
-                        }
-                        _, size := utf8.DecodeRuneInString(current[byteIdx:])
-                        byteIdx += size
-                        runeCount++
-                    }
-                    editIndex = byteIdx
+                    // edit_index is a BYTE offset, use it directly
                     if editIndex <= len(current) {
                         current = current[:editIndex] + ec
                     } else {
@@ -2109,7 +2099,7 @@ func streamSSEResponse(body io.Reader, ch chan<- ZAIResult) error {
                 }
                 fullText.Reset()
                 fullText.WriteString(current)
-            } else if dc, ok := data["delta_content"].(string); ok && dc != "" {
+            } else if dc, ok := data["delta_content"].(string); ok && dc != "" {            
                 fullText.WriteString(dc)
             } else if tc, ok := data["content"].(string); ok && tc != "" {
                 fullText.WriteString(tc)
