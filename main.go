@@ -40,7 +40,6 @@ import (
     "sync"
     "sync/atomic"
     "time"
-    "unicode/utf8"
 
     _ "modernc.org/sqlite"
 )
