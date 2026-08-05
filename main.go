@@ -1887,6 +1887,27 @@ func statusFromError(errMsg string) int {
     }
 }
 
+// safeUTF8Delta extracts new content ensuring no UTF-8 char is split
+func safeUTF8Delta(fullContent string, sentLen int) (delta string, newSentLen int) {
+    if len(fullContent) <= sentLen {
+        return "", sentLen
+    }
+    start := sentLen
+    for start > 0 && start < len(fullContent) && fullContent[start]&0xC0 == 0x80 {
+        start--
+    }
+    end := len(fullContent)
+    for end > start {
+        r, size := utf8.DecodeLastRuneInString(fullContent[start:end])
+        if r == utf8.RuneError && size == 1 {
+            end--
+        } else {
+            break
+        }
+    }
+    return fullContent[start:end], end
+}
+
 func streamSSEResponse(body io.Reader, ch chan<- ZAIResult) error {
     scanner := bufio.NewScanner(body)
     scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
@@ -1941,16 +1962,20 @@ func streamSSEResponse(body io.Reader, ch chan<- ZAIResult) error {
 
         // Emit content delta
         if len(content) > sentLen {
-            ch <- ZAIResult{Chunk: content[sentLen:], FullText: content}
-            sentLen = len(content)
+            cDelta, cNewLen := safeUTF8Delta(content, sentLen)
+            ch <- ZAIResult{Chunk: cDelta, FullText: content}
+            sentLen = cNewLen
+        }
         } else if len(content) < sentLen {
             sentLen = len(content)
         }
 
         // Emit reasoning delta
         if len(reasoning) > sentReasoning {
-            ch <- ZAIResult{Reasoning: reasoning[sentReasoning:]}
-            sentReasoning = len(reasoning)
+            rDelta, rNewLen := safeUTF8Delta(reasoning, sentReasoning)
+            ch <- ZAIResult{Reasoning: rDelta}
+            sentReasoning = rNewLen
+        }
         } else if len(reasoning) < sentReasoning {
             sentReasoning = len(reasoning)
         }
@@ -2596,11 +2621,11 @@ func anthropicStreamResponse(w http.ResponseWriter, prompt string, opts SendOpti
             }
         }
 
-        if len(fullContent) <= len(sentContent) {
+        delta, newLen := safeUTF8Delta(fullContent, len(sentContent))
+        if delta == "" {
             continue
         }
-        delta := fullContent[len(sentContent):]
-        sentContent = fullContent
+        sentContent = fullContent[:newLen]
 
         if interceptor != nil {
             contentDelta, toolCalls, _ := interceptor.feed(delta)
@@ -4035,12 +4060,12 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
                         interceptor = newAgentStreamInterceptor()
                     }
                 }
-                
-                if len(fullContent) <= len(sentContent) {
+                delta, newLen := safeUTF8Delta(fullContent, len(sentContent))
+                if delta == "" {
                     continue
                 }
-                delta := fullContent[len(sentContent):]
-                sentContent = fullContent
+                sentContent = fullContent[:newLen]
+                
 
                 if interceptor != nil {
                     contentDelta, toolCalls, _ := interceptor.feed(delta)
