@@ -1885,7 +1885,9 @@ func statusFromError(errMsg string) int {
     default:
         return 500
     }
-    // safeUTF8Delta ensures we don't cut multi-byte UTF-8 characters in half
+}
+
+// safeUTF8Delta ensures we don't cut multi-byte UTF-8 characters in half
 func safeUTF8Delta(fullContent string, sentLen int) (delta string, newSentLen int) {
     if len(fullContent) <= sentLen {
         return "", sentLen
@@ -1964,7 +1966,6 @@ func streamSSEResponse(body io.Reader, ch chan<- ZAIResult) error {
             cDelta, cNewLen := safeUTF8Delta(content, sentLen)
             ch <- ZAIResult{Chunk: cDelta, FullText: content}
             sentLen = cNewLen
-        }
         } else if len(content) < sentLen {
             sentLen = len(content)
         }
@@ -1974,7 +1975,6 @@ func streamSSEResponse(body io.Reader, ch chan<- ZAIResult) error {
             rDelta, rNewLen := safeUTF8Delta(reasoning, sentReasoning)
             ch <- ZAIResult{Reasoning: rDelta}
             sentReasoning = rNewLen
-        }
         } else if len(reasoning) < sentReasoning {
             sentReasoning = len(reasoning)
         }
@@ -4064,7 +4064,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
                     }
                 }
                 
-                if len(fullContent) <= len(sentContent) { کدومببذ
+                if len(fullContent) <= len(sentContent) {
                     continue
                 }
                 delta, newLen := safeUTF8Delta(fullContent, len(sentContent))
