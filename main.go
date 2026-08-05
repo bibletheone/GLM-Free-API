@@ -1732,12 +1732,12 @@ func sendToZAIStream(prompt string, opts struct {
         // image_generation is ALWAYS false
         featuresPayload["image_generation"] = false
 
-        requestBody := map[string]interface{}{
+            requestBody := map[string]interface{}{
             "model":                opts.Model,
             "chat_id":              opts.ChatID,
             "messages":             messagesField,
             "signature_prompt":     prompt,
-            "stream":               true,
+            "stream":               false, // Changed to false to fix UTF-8
             "captcha_verify_param": captchaParam,
             "features":             featuresPayload,
         }
@@ -1810,13 +1810,107 @@ func sendToZAIStream(prompt string, opts struct {
             return fmt.Errorf("Z.AI error %d: %s", resp.StatusCode, string(errBody))
         }
 
-        err = streamSSEResponse(resp.Body, ch)
+                // Instead of streaming, read the full body to prevent UTF-8 fragmentation
+        respBody, err := io.ReadAll(resp.Body)
         resp.Body.Close()
         cancel()
-        return err
+        if err != nil {
+            return fmt.Errorf("Z.AI read error: %s", err.Error())
+        }
+
+        // Check if response is SSE (starts with "data: ")
+        if bytes.HasPrefix(bytes.TrimSpace(respBody), []byte("data: ")) {
+            // Fallback: It's a stream, parse as SSE
+            return streamSSEResponse(bytes.NewReader(respBody), ch)
+        }
+
+        // It's a non-stream JSON response
+        var generic map[string]interface{}
+        if err := json.Unmarshal(respBody, &generic); err != nil {
+            return fmt.Errorf("Z.AI parse error: %w", err)
+        }
+
+        // Check for error
+        if data, ok := generic["data"].(map[string]interface{}); ok {
+            if errObj, ok := data["error"].(map[string]interface{}); ok {
+                detail, _ := errObj["detail"].(string)
+                if detail == "" {
+                    detail, _ = errObj["message"].(string)
+                }
+                if detail != "" {
+                    return fmt.Errorf("Z.AI error: %s", detail)
+                }
+            }
+        }
+        if errObj, ok := generic["error"].(map[string]interface{}); ok {
+            detail, _ := errObj["detail"].(string)
+            if detail == "" {
+                detail, _ = errObj["message"].(string)
+            }
+            if detail != "" {
+                return fmt.Errorf("Z.AI error: %s", detail)
+            }
+        }
+
+        var fullContent string
+        var fullReasoning string
+
+        if data, ok := generic["data"].(map[string]interface{}); ok {
+            if c, ok := data["content"].(string); ok {
+                fullContent = c
+            }
+            if r, ok := data["reasoning_content"].(string); ok {
+                fullReasoning = r
+            }
+        } else if choices, ok := generic["choices"].([]interface{}); ok && len(choices) > 0 {
+            if choice, ok := choices[0].(map[string]interface{}); ok {
+                if msg, ok := choice["message"].(map[string]interface{}); ok {
+                    if c, ok := msg["content"].(string); ok {
+                        fullContent = c
+                    }
+                    if r, ok := msg["reasoning_content"].(string); ok {
+                        fullReasoning = r
+                    }
+                }
+            }
+        }
+
+        // Sometimes Z.AI puts reasoning in <details> inside content
+        if fullReasoning == "" && strings.Contains(fullContent, "<details") {
+            if idx := strings.Index(fullContent, "<details"); idx >= 0 {
+                if tagEnd := strings.Index(fullContent[idx:], ">"); tagEnd >= 0 {
+                    afterTag := fullContent[idx+tagEnd+1:]
+                    if closeIdx := strings.Index(afterTag, "</details>"); closeIdx >= 0 {
+                        fullReasoning = afterTag[:closeIdx]
+                        fullContent = fullContent[:idx] + afterTag[closeIdx+len("</details>"):]
+                    }
+                }
+            }
+        }
+
+        if fullReasoning != "" {
+            fullReasoning = strings.ReplaceAll(fullReasoning, "<details>", "")
+            fullReasoning = strings.ReplaceAll(fullReasoning, "</details>", "")
+            lines := strings.Split(fullReasoning, "\n")
+            for i, l := range lines {
+                lines[i] = strings.TrimPrefix(l, "> ")
+            }
+            fullReasoning = strings.TrimSpace(strings.Join(lines, "\n"))
+        }
+
+        fullContent = strings.TrimSpace(fullContent)
+
+        if fullReasoning != "" {
+            ch <- ZAIResult{Reasoning: fullReasoning}
+        }
+        
+        ch <- ZAIResult{FullText: fullContent, Chunk: fullContent}
+
+        return nil
     }
     return errors.New("Max retries exceeded")
 }
+
 
 // extractZAIError inspects a parsed Z.AI SSE payload for an embedded error
 // (Z.AI sometimes returns HTTP 200 with the error inside the JSON body).
