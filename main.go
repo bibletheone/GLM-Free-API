@@ -1885,6 +1885,26 @@ func statusFromError(errMsg string) int {
     default:
         return 500
     }
+    // safeUTF8Delta ensures we don't cut multi-byte UTF-8 characters in half
+func safeUTF8Delta(fullContent string, sentLen int) (delta string, newSentLen int) {
+    if len(fullContent) <= sentLen {
+        return "", sentLen
+    }
+    start := sentLen
+    for start > 0 && start < len(fullContent) && fullContent[start]&0xC0 == 0x80 {
+        start--
+    }
+    end := len(fullContent)
+    for end > start {
+        r, size := utf8.DecodeLastRuneInString(fullContent[start:end])
+        if r == utf8.RuneError && size == 1 {
+            end--
+        } else {
+            break
+        }
+    }
+    return fullContent[start:end], end
+}
 }
 
 func streamSSEResponse(body io.Reader, ch chan<- ZAIResult) error {
@@ -1941,16 +1961,20 @@ func streamSSEResponse(body io.Reader, ch chan<- ZAIResult) error {
 
         // Emit content delta
         if len(content) > sentLen {
-            ch <- ZAIResult{Chunk: content[sentLen:], FullText: content}
-            sentLen = len(content)
+            cDelta, cNewLen := safeUTF8Delta(content, sentLen)
+            ch <- ZAIResult{Chunk: cDelta, FullText: content}
+            sentLen = cNewLen
+        }
         } else if len(content) < sentLen {
             sentLen = len(content)
         }
 
         // Emit reasoning delta
         if len(reasoning) > sentReasoning {
-            ch <- ZAIResult{Reasoning: reasoning[sentReasoning:]}
-            sentReasoning = len(reasoning)
+            rDelta, rNewLen := safeUTF8Delta(reasoning, sentReasoning)
+            ch <- ZAIResult{Reasoning: rDelta}
+            sentReasoning = rNewLen
+        }
         } else if len(reasoning) < sentReasoning {
             sentReasoning = len(reasoning)
         }
@@ -2526,6 +2550,7 @@ func anthropicStreamResponse(w http.ResponseWriter, prompt string, opts SendOpti
         })
     }
 
+
     stopBlock := func() {
         if currentBlockType != "" {
             writeEvent("content_block_stop", map[string]interface{}{
@@ -2599,8 +2624,11 @@ func anthropicStreamResponse(w http.ResponseWriter, prompt string, opts SendOpti
         if len(fullContent) <= len(sentContent) {
             continue
         }
-        delta := fullContent[len(sentContent):]
-        sentContent = fullContent
+        delta, newLen := safeUTF8Delta(fullContent, len(sentContent))
+        if delta == "" {
+            continue
+        }
+        sentContent = fullContent[:newLen]
 
         if interceptor != nil {
             contentDelta, toolCalls, _ := interceptor.feed(delta)
@@ -4036,11 +4064,14 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
                     }
                 }
                 
-                if len(fullContent) <= len(sentContent) {
+                if len(fullContent) <= len(sentContent) { کدومببذ
                     continue
                 }
-                delta := fullContent[len(sentContent):]
-                sentContent = fullContent
+                delta, newLen := safeUTF8Delta(fullContent, len(sentContent))
+                if delta == "" {
+                    continue
+                }
+                sentContent = fullContent[:newLen]
 
                 if interceptor != nil {
                     contentDelta, toolCalls, _ := interceptor.feed(delta)
