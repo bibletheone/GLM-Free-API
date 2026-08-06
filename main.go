@@ -1982,14 +1982,11 @@ func statusFromError(errMsg string) int {
 
 
 
-
 func streamSSEResponse(body io.Reader, ch chan<- ZAIResult) error {
     scanner := bufio.NewScanner(body)
     scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
 
     var fullText strings.Builder
-    sentLen := 0
-    sentReasoning := 0
 
     stripDetailsTags := func(s string) string {
         if idx := strings.Index(s, "<details"); idx >= 0 {
@@ -2028,22 +2025,10 @@ func streamSSEResponse(body io.Reader, ch chan<- ZAIResult) error {
 
         if reasoning != "" {
             reasoning = stripDetailsTags(reasoning)
+            ch <- ZAIResult{Reasoning: reasoning}
         }
-
-        if len(content) > sentLen {
-            delta := content[sentLen:]
-            ch <- ZAIResult{Chunk: delta, FullText: content}
-            sentLen = len(content)
-        } else if len(content) < sentLen {
-            sentLen = len(content)
-        }
-
-        if len(reasoning) > sentReasoning {
-            delta := reasoning[sentReasoning:]
-            ch <- ZAIResult{Reasoning: delta}
-            sentReasoning = len(reasoning)
-        } else if len(reasoning) < sentReasoning {
-            sentReasoning = len(reasoning)
+        if content != "" {
+            ch <- ZAIResult{FullText: content}
         }
     }
 
@@ -2078,14 +2063,12 @@ func streamSSEResponse(body io.Reader, ch chan<- ZAIResult) error {
 
         if data, ok := j["data"].(map[string]interface{}); ok {
             if ec, ok := data["edit_content"].(string); ok && ec != "" {
-                // edit_content = FULL replacement starting at edit_index
                 editIndex := -1
                 if ei, ok := data["edit_index"].(float64); ok {
                     editIndex = int(ei)
                 }
                 current := fullText.String()
                 if editIndex >= 0 {
-                    // Convert rune-based edit_index to byte offset
                     byteIdx := 0
                     runeCount := 0
                     for byteIdx < len(current) {
@@ -2096,13 +2079,10 @@ func streamSSEResponse(body io.Reader, ch chan<- ZAIResult) error {
                         byteIdx += size
                         runeCount++
                     }
-                    editIndex = byteIdx
-
-                    if editIndex <= len(current) {
-                        current = current[:editIndex] + ec
+                    if byteIdx <= len(current) {
+                        current = current[:byteIdx] + ec
                     } else {
-                        // Z.AI index beyond current length — pad
-                        for len(current) < editIndex {
+                        for len(current) < byteIdx {
                             current += " "
                         }
                         current += ec
@@ -2112,7 +2092,7 @@ func streamSSEResponse(body io.Reader, ch chan<- ZAIResult) error {
                 }
                 fullText.Reset()
                 fullText.WriteString(current)
-            } else if dc, ok := data["delta_content"].(string); ok && dc != "" {            
+            } else if dc, ok := data["delta_content"].(string); ok && dc != "" {
                 fullText.WriteString(dc)
             } else if tc, ok := data["content"].(string); ok && tc != "" {
                 fullText.WriteString(tc)
@@ -2125,7 +2105,6 @@ func streamSSEResponse(body io.Reader, ch chan<- ZAIResult) error {
     flush()
     return scanner.Err()
 }
-
 
 // ============================================================================
 // FORMAT HELPERS
@@ -2678,10 +2657,29 @@ func anthropicStreamResponse(w http.ResponseWriter, prompt string, opts SendOpti
         }
 
         if len(fullContent) <= len(sentContent) {
+            if fullContent == sentContent {
+                continue
+            }
             continue
         }
-        delta := fullContent[len(sentContent):]
-        sentContent = fullContent
+        
+        var delta string
+        if strings.HasPrefix(fullContent, sentContent) {
+            delta = fullContent[len(sentContent):]
+            sentContent = fullContent
+        } else {
+            sentRunes := []rune(sentContent)
+            fullRunes := []rune(fullContent)
+            common := 0
+            for common < len(sentRunes) && common < len(fullRunes) {
+                if sentRunes[common] != fullRunes[common] {
+                    break
+                }
+                common++
+            }
+            delta = string(fullRunes[common:])
+            sentContent = sentContent + delta
+        }
 
         if interceptor != nil {
             contentDelta, toolCalls, _ := interceptor.feed(delta)
@@ -4118,10 +4116,29 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
                 }
                 
                 if len(fullContent) <= len(sentContent) {
+                    if fullContent == sentContent {
+                        continue
+                    }
                     continue
                 }
-                delta := fullContent[len(sentContent):]
-                sentContent = fullContent
+                
+                var delta string
+                if strings.HasPrefix(fullContent, sentContent) {
+                    delta = fullContent[len(sentContent):]
+                    sentContent = fullContent
+                } else {
+                    sentRunes := []rune(sentContent)
+                    fullRunes := []rune(fullContent)
+                    common := 0
+                    for common < len(sentRunes) && common < len(fullRunes) {
+                        if sentRunes[common] != fullRunes[common] {
+                            break
+                        }
+                        common++
+                    }
+                    delta = string(fullRunes[common:])
+                    sentContent = sentContent + delta
+                }
 
                 if interceptor != nil {
                     contentDelta, toolCalls, _ := interceptor.feed(delta)
